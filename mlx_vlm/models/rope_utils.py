@@ -504,8 +504,15 @@ def initialize_rope(
     raise ValueError(f"Unsupported RoPE type {rope_type}")
 
 
-def _cumulative_splits(lengths: Sequence[int]):
-    return mx.cumsum(mx.array(lengths, dtype=mx.int32))[:-1]
+def _cumulative_splits(lengths: Sequence[int]) -> List[int]:
+    # mx.split() only accepts int | Sequence[int] for indices_or_sections, so
+    # keep these section boundaries as plain Python ints.
+    total = 0
+    splits = []
+    for length in lengths[:-1]:
+        total += int(length)
+        splits.append(total)
+    return splits
 
 
 def _interleaved_position_selector(mrope_section: Sequence[int], freq_dim: int):
