@@ -635,6 +635,76 @@ def test_exact_cache_supports_rotating_and_chunked_kv_cache():
     _assert_allclose(warm[2].values, chunked.values)
 
 
+def test_exact_cache_store_can_take_ownership_without_cloning(monkeypatch):
+    from mlx_vlm.models.cache import KVCache
+
+    token_ids = list(range(32))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 2))
+    kv.values = mx.ones((1, 1, len(token_ids), 2)) * 2
+    kv.offset = len(token_ids)
+    manager = APCManager(num_blocks=1, block_size=16)
+
+    def fail_clone(*args, **kwargs):
+        raise AssertionError("an owned snapshot must not be cloned again")
+
+    monkeypatch.setattr(apc_module, "_clone_prompt_cache_for_apc", fail_clone)
+
+    assert manager.store_exact_cache(
+        token_ids,
+        [kv],
+        take_ownership=True,
+    )
+    stored = next(iter(manager._exact_cache.values())).prompt_cache
+    assert stored[0] is kv
+
+
+def test_exact_cache_store_clones_by_default():
+    from mlx_vlm.models.cache import KVCache
+
+    token_ids = list(range(32))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 2))
+    kv.values = mx.ones((1, 1, len(token_ids), 2)) * 2
+    kv.offset = len(token_ids)
+    manager = APCManager(num_blocks=1, block_size=16)
+
+    assert manager.store_exact_cache(token_ids, [kv])
+    stored = next(iter(manager._exact_cache.values())).prompt_cache
+    assert stored[0] is not kv
+    assert stored[0].keys is not kv.keys
+    assert stored[0].values is not kv.values
+
+
+def test_exact_checkpoint_transfers_detached_snapshot_to_manager(monkeypatch):
+    from mlx_vlm.generate.ar import PromptProcessingBatch
+
+    snapshot = [object()]
+    manager = SimpleNamespace(store_exact_cache=lambda *args, **kwargs: True)
+    calls = []
+    manager.store_exact_cache = lambda *args, **kwargs: calls.append((args, kwargs))
+
+    batch = PromptProcessingBatch.__new__(PromptProcessingBatch)
+    batch._apc_manager = manager
+    batch._apc_mode = "exact"
+    batch._apc_meta = [
+        {
+            "full_input_ids": list(range(32)),
+            "prefix_len": 0,
+            "checkpoint_len": 32,
+            "extra_hash": 9,
+        }
+    ]
+    monkeypatch.setattr(batch, "_row_real_tokens_processed", lambda index: 32)
+    monkeypatch.setattr(batch, "_apc_prompt_cache_for_store", lambda index: snapshot)
+
+    batch._store_apc_exact_checkpoints()
+
+    assert len(calls) == 1
+    assert calls[0][0][1] is snapshot
+    assert calls[0][1]["take_ownership"] is True
+
+
 def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
     from mlx_vlm.models.cache import ArraysCache, KVCache
 

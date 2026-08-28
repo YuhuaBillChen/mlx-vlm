@@ -3275,14 +3275,24 @@ class APCManager:
         prompt_cache: Sequence[Any],
         *,
         extra_hash: int = 0,
+        take_ownership: bool = False,
     ) -> bool:
-        """Store a full prompt-cache snapshot for exact-prefix reuse."""
+        """Store a full prompt-cache snapshot for exact-prefix reuse.
+
+        By default the manager defensively clones the supplied cache. Callers
+        may set *take_ownership* only when every entry is already a detached
+        snapshot that they will not access or mutate after this call.
+        """
         if len(token_ids) < self.exact_cache_min_tokens:
             return False
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
-        copied = _clone_prompt_cache_for_apc(prompt_cache)
+        copied = (
+            list(prompt_cache)
+            if take_ownership
+            else _clone_prompt_cache_for_apc(prompt_cache)
+        )
         if copied is None:
             types = [type(c).__name__ for c in prompt_cache]
             logger.warning(

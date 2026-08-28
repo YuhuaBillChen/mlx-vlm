@@ -1904,6 +1904,7 @@ class PromptProcessingBatch:
                 meta["full_input_ids"][:checkpoint_len],
                 prompt_cache,
                 extra_hash=meta.get("extra_hash", 0),
+                take_ownership=True,
             )
             meta["checkpoint_done"] = True
 
@@ -2141,6 +2142,7 @@ class PromptProcessingBatch:
                                 meta["full_input_ids"],
                                 prompt_cache,
                                 extra_hash=meta.get("extra_hash", 0),
+                                take_ownership=True,
                             )
                         self._apc_manager.release(meta.get("apc_blocks", []))
                     else:
