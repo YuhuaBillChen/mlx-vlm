@@ -46,6 +46,7 @@ from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs, resolve_eos_token_ids
 from .draft_lifecycle import LazyDrafter
 from .runtime import runtime
+from .vision_lifecycle import VisionTowerPhaseSwap
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -1003,6 +1004,7 @@ class ResponseGenerator:
         draft_model_path: Optional[str] = None,
         draft_kind: Optional[str] = None,
         defer_draft_model: bool = False,
+        vision_phase_swap_path: Optional[str] = None,
         prefill_step_size: Optional[int] = None,
     ):
         self.model_path = model_path
@@ -1018,6 +1020,8 @@ class ResponseGenerator:
             "MLX_VLM_DEFER_DRAFT_MODEL", "0"
         ).lower() in ("1", "true", "yes")
         self.draft_model = None
+        self.vision_phase_swap_path = vision_phase_swap_path
+        self.vision_phase_swap = None
         self.kv_bits = kv_bits
         self.kv_key_bits = kv_key_bits
         self.kv_value_bits = kv_value_bits
@@ -1165,6 +1169,13 @@ class ResponseGenerator:
         self.stop_tokens = stop_tokens
         self.draft_model = draft_model
         self.draft_kind = draft_kind
+        vision_component = self.vision_phase_swap_path or os.environ.get(
+            "MLX_VLM_VISION_PHASE_SWAP_PATH"
+        )
+        if vision_component:
+            if get_max_num_seqs() != 1:
+                raise ValueError("Vision phase swap requires --max-num-seqs 1.")
+            self.vision_phase_swap = VisionTowerPhaseSwap(model, vision_component)
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1619,6 +1630,15 @@ class ResponseGenerator:
             for k, v in raw_inputs.items()
             if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
+        media_uses_vision = pixel_values is not None or any(
+            data_kwargs.get(name) is not None
+            for name in ("pixel_values_videos", "image_grid_thw", "video_grid_thw")
+        )
+        phase_swap = (
+            getattr(self, "vision_phase_swap", None) if media_uses_vision else None
+        )
+        if phase_swap is not None:
+            phase_swap.load()
         # Pass vision cache for image feature caching
         if (
             pixel_values is not None
@@ -1629,9 +1649,21 @@ class ResponseGenerator:
             data_kwargs["_image_key"] = images
 
         # Always call get_input_embeddings — BatchGenerator requires inputs_embeds
-        embed = self.model.get_input_embeddings(
-            input_ids, pixel_values, mask=mask, **data_kwargs
-        )
+        try:
+            embed = self.model.get_input_embeddings(
+                input_ids, pixel_values, mask=mask, **data_kwargs
+            )
+            if phase_swap is not None:
+                arrays = [
+                    value
+                    for value in embed.to_dict().values()
+                    if value is not None and hasattr(value, "shape")
+                ]
+                if arrays:
+                    mx.eval(arrays)
+        finally:
+            if phase_swap is not None:
+                phase_swap.unload()
         # Remove cache kwargs before passing to BatchGenerator
         data_kwargs.pop("vision_cache", None)
         data_kwargs.pop("_image_key", None)

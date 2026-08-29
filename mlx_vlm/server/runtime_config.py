@@ -132,6 +132,14 @@ KNOBS: Tuple[
         "Keep MTP drafter weights unloaded until decode begins.",
     ),
     (
+        "vision_phase_swap_path",
+        "str_or_none",
+        None,
+        TEXT_KINDS,
+        None,
+        "Standalone vision-tower weights used for request-phase loading.",
+    ),
+    (
         "vision_cache_size",
         "int",
         20,
@@ -206,6 +214,7 @@ class RuntimeConfig:
     spec_draft_model: Optional[str] = None
     spec_draft_kind: Optional[str] = None
     spec_defer_draft_model: bool = False
+    vision_phase_swap_path: Optional[str] = None
     vision_cache_size: int = 20
 
     _lock: threading.Lock = field(
@@ -240,6 +249,8 @@ class RuntimeConfig:
                 "MLX_VLM_DEFER_DRAFT_MODEL", "0"
             ).lower()
             in ("1", "true", "yes"),
+            vision_phase_swap_path=os.environ.get("MLX_VLM_VISION_PHASE_SWAP_PATH")
+            or None,
             vision_cache_size=int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20")),
         )
         cfg._env_defaults = {name: getattr(cfg, name) for name in _KNOB_SPEC}

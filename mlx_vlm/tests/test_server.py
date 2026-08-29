@@ -753,6 +753,8 @@ def _unstarted_response_generator():
     gen.draft_model_path = None
     gen.draft_kind_override = None
     gen.defer_draft_model = False
+    gen.vision_phase_swap_path = None
+    gen.vision_phase_swap = None
     gen.kv_bits = None
     gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
     gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
@@ -806,6 +808,30 @@ def test_server_defers_compatible_mtp_drafter_until_decode(monkeypatch):
     assert isinstance(gen.draft_model, server_generation.LazyDrafter)
     assert gen.draft_model.config is drafter_config
     assert not gen.draft_model.loaded
+
+
+def test_server_initializes_vision_phase_swap(monkeypatch):
+    config = SimpleNamespace(eos_token_id=[])
+    model = SimpleNamespace(language_model=SimpleNamespace(), vision_tower=object())
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    phase_swap = object()
+    gen = _unstarted_response_generator()
+    gen.vision_phase_swap_path = "vision.safetensors"
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "1")
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+    constructor = MagicMock(return_value=phase_swap)
+    monkeypatch.setattr(server_generation, "VisionTowerPhaseSwap", constructor)
+
+    gen._initialize_model()
+
+    constructor.assert_called_once_with(model, "vision.safetensors")
+    assert gen.vision_phase_swap is phase_swap
 
 
 @pytest.mark.parametrize(
@@ -6528,6 +6554,7 @@ class TestResponseGenerator:
             "MLX_VLM_THINKING_END_TOKEN",
             "MLX_VLM_SERVER_API_KEY",
             "MLX_VLM_DEFER_DRAFT_MODEL",
+            "MLX_VLM_VISION_PHASE_SWAP_PATH",
             "PREFILL_STEP_SIZE",
             "KV_GROUP_SIZE",
             "KV_QUANT_SCHEME",
@@ -6565,6 +6592,8 @@ class TestResponseGenerator:
                 "--api-key",
                 "admin-token",
                 "--defer-draft-model",
+                "--vision-phase-swap-path",
+                "vision.safetensors",
             ],
         )
         run_calls = []
@@ -6589,6 +6618,7 @@ class TestResponseGenerator:
             assert os.environ["MLX_VLM_MODEL_DISCOVERY"] == "served"
             assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
             assert os.environ["MLX_VLM_DEFER_DRAFT_MODEL"] == "1"
+            assert os.environ["MLX_VLM_VISION_PHASE_SWAP_PATH"] == "vision.safetensors"
             assert run_calls[0][1]["host"] == "127.0.0.1"
         finally:
             for env_var in (
@@ -6607,6 +6637,7 @@ class TestResponseGenerator:
                 "MLX_VLM_THINKING_END_TOKEN",
                 "MLX_VLM_SERVER_API_KEY",
                 "MLX_VLM_DEFER_DRAFT_MODEL",
+                "MLX_VLM_VISION_PHASE_SWAP_PATH",
             ):
                 os.environ.pop(env_var, None)
 
@@ -6772,6 +6803,38 @@ class TestResponseGenerator:
         assert "position_ids" not in gen_kwargs
         assert "rope_deltas" not in gen_kwargs
         assert "_apc_semantic_hash" not in gen_kwargs
+
+    def test_gpu_embed_unloads_phase_swapped_vision_after_materialization(
+        self, monkeypatch
+    ):
+        class Embed:
+            def to_dict(self):
+                return {"inputs_embeds": mx.zeros((1, 2, 4))}
+
+        class Model:
+            def get_input_embeddings(
+                self, input_ids, pixel_values, mask=None, **kwargs
+            ):
+                return Embed()
+
+        phase_swap = SimpleNamespace(load=MagicMock(), unload=MagicMock())
+        response_generator = SimpleNamespace(
+            model=Model(), vision_cache=None, vision_phase_swap=phase_swap
+        )
+        eval_arrays = MagicMock()
+        monkeypatch.setattr(server_generation.mx, "eval", eval_arrays)
+
+        server.ResponseGenerator._gpu_embed(
+            response_generator,
+            {
+                "input_ids": mx.array([[1, 2]]),
+                "pixel_values": mx.ones((1, 1, 1, 1)),
+            },
+        )
+
+        phase_swap.load.assert_called_once_with()
+        phase_swap.unload.assert_called_once_with()
+        eval_arrays.assert_called_once()
 
     def test_gpu_embed_uses_precomputed_semantic_hash(self):
         class Embed:
@@ -7487,6 +7550,7 @@ class TestRuntimeConfigAdditions:
             "spec_draft_model",
             "spec_draft_kind",
             "spec_defer_draft_model",
+            "vision_phase_swap_path",
         ):
             assert name in spec
             assert spec[name]["reload_kinds"] == ["text_generation"]
@@ -7545,11 +7609,18 @@ class TestRuntimeConfigAdditions:
         monkeypatch.setattr(server.runtime.config, "spec_draft_model", "draft-x")
         monkeypatch.setattr(server.runtime.config, "spec_draft_kind", "auto")
         monkeypatch.setattr(server.runtime.config, "spec_defer_draft_model", True)
+        monkeypatch.setattr(
+            server.runtime.config, "vision_phase_swap_path", "vision.safetensors"
+        )
 
         server.get_cached_model("demo-model")
         assert FakeResponseGenerator.last_kwargs["draft_model_path"] == "draft-x"
         assert FakeResponseGenerator.last_kwargs["draft_kind"] == "auto"
         assert FakeResponseGenerator.last_kwargs["defer_draft_model"] is True
+        assert (
+            FakeResponseGenerator.last_kwargs["vision_phase_swap_path"]
+            == "vision.safetensors"
+        )
 
     def test_settings_patch_replace_semantics(self, client, monkeypatch):
         monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
