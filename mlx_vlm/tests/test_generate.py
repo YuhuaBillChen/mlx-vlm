@@ -739,6 +739,33 @@ class TestBatchGenerator:
         async_eval_mock.assert_called_once_with([cache_state])
         eval_mock.assert_not_called()
 
+    def test_prompt_step_builds_only_the_current_embedding_chunk(self, monkeypatch):
+        cache_state = mx.array([1])
+        calls = []
+
+        def provider(input_ids, *, start):
+            calls.append((input_ids.tolist(), start))
+            return mx.ones((1, input_ids.shape[1], 4))
+
+        model = MagicMock()
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[1],
+            input_ids=[[1, 2, 3, 4, 5]],
+            max_tokens=[1],
+            inputs_embeds=None,
+            prompt_kwargs={"input_embedding_provider": provider},
+            prefill_step_size=2,
+            warm_cache=[SimpleNamespace(state=cache_state)],
+        )
+        monkeypatch.setattr(ar_module.mx, "async_eval", MagicMock())
+        monkeypatch.setattr(ar_module.mx, "clear_cache", MagicMock())
+
+        assert batch.prompt_step() == 2
+        assert calls == [([[1, 2]], 0)]
+        assert model.call_args.kwargs["inputs_embeds"].shape == (1, 2, 4)
+        assert batch._input_ids.tolist() == [[3, 4, 5]]
+
     def test_prompt_step_keeps_exact_apc_checkpoint_async(self, monkeypatch):
         cache_state = mx.array([1])
         batch = PromptProcessingBatch(
@@ -3290,6 +3317,59 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     assert "_apc_image_hash" not in captured["prompt_kwargs"]
     assert "_apc_semantic_hash" not in captured["prompt_kwargs"]
     assert captured["prompt_kwargs"]["keep_tensor"].shape == (2, 1)
+
+
+def test_single_row_apc_offsets_chunk_local_embedding_provider():
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = object()
+    bg.model = SimpleNamespace(layers=[object()])
+    bg.prefill_step_size = 2
+    bg.kv_bits = None
+    bg.kv_group_size = 64
+    bg.kv_quant_scheme = "affine"
+    bg._wire_stack = None
+    calls = []
+
+    def provider(input_ids, *, start):
+        calls.append((input_ids.tolist(), start))
+        return mx.ones((1, input_ids.shape[1], 4))
+
+    sequence = (
+        1,
+        list(range(8)),
+        1,
+        {ar_module.INPUT_EMBEDDING_PROVIDER_KEY: provider},
+        [],
+        None,
+    )
+    pick = {
+        "matched_blocks": [],
+        "prefix_len": 4,
+        "extra_hash": 0,
+        "full_input_ids": list(range(8)),
+    }
+    captured = {}
+
+    def fake_prompt_batch(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    with (
+        patch.object(BatchGenerator, "_apc_pick_for", return_value=pick),
+        patch.object(
+            ar_module._apc,
+            "make_warm_batch_kv_cache_multi",
+            return_value=([], 4),
+        ),
+        patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch),
+    ):
+        batch = bg._build_mixed_prompt_batch([sequence])
+
+    assert batch is not None
+    assert captured["inputs_embeds"] is None
+    suffix_provider = captured["prompt_kwargs"][ar_module.INPUT_EMBEDDING_PROVIDER_KEY]
+    suffix_provider(mx.array([[4, 5]]), start=1)
+    assert calls == [([[4, 5]], 5)]
 
 
 def test_apc_pick_rejects_image_tokens_and_releases_blocks():

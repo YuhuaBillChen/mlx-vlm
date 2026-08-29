@@ -1005,6 +1005,7 @@ class ResponseGenerator:
         draft_kind: Optional[str] = None,
         defer_draft_model: bool = False,
         vision_phase_swap_path: Optional[str] = None,
+        chunk_local_input_embeddings: bool = False,
         prefill_step_size: Optional[int] = None,
     ):
         self.model_path = model_path
@@ -1022,6 +1023,15 @@ class ResponseGenerator:
         self.draft_model = None
         self.vision_phase_swap_path = vision_phase_swap_path
         self.vision_phase_swap = None
+        self.chunk_local_input_embeddings = bool(
+            chunk_local_input_embeddings
+        ) or os.environ.get("MLX_VLM_CHUNK_LOCAL_INPUT_EMBEDS", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if self.chunk_local_input_embeddings and get_max_num_seqs() != 1:
+            raise ValueError("Chunk-local input embeddings require --max-num-seqs 1.")
         self.kv_bits = kv_bits
         self.kv_key_bits = kv_key_bits
         self.kv_value_bits = kv_value_bits
@@ -1166,6 +1176,13 @@ class ResponseGenerator:
         self.model = model
         self.processor = processor
         self.config = config
+        if (
+            self.chunk_local_input_embeddings
+            and getattr(config, "model_type", None) != "qwen3_5"
+        ):
+            raise ValueError(
+                "Chunk-local input embeddings currently support Qwen3.5 only."
+            )
         self.stop_tokens = stop_tokens
         self.draft_model = draft_model
         self.draft_kind = draft_kind
@@ -1650,8 +1667,14 @@ class ResponseGenerator:
 
         # Always call get_input_embeddings — BatchGenerator requires inputs_embeds
         try:
+            embedding_kwargs = dict(data_kwargs)
+            if getattr(self, "chunk_local_input_embeddings", False):
+                embedding_kwargs["chunked"] = True
             embed = self.model.get_input_embeddings(
-                input_ids, pixel_values, mask=mask, **data_kwargs
+                input_ids,
+                pixel_values,
+                mask=mask,
+                **embedding_kwargs,
             )
             if phase_swap is not None:
                 arrays = [
@@ -1659,6 +1682,10 @@ class ResponseGenerator:
                     for value in embed.to_dict().values()
                     if value is not None and hasattr(value, "shape")
                 ]
+                provider = getattr(embed, "input_embedding_provider", None)
+                image_features = getattr(provider, "image_features", None)
+                if image_features is not None:
+                    arrays.append(image_features)
                 if arrays:
                     mx.eval(arrays)
         finally:
@@ -1671,6 +1698,9 @@ class ResponseGenerator:
             **data_kwargs,
             **{k: v for k, v in embed.to_dict().items() if v is not None},
         }
+        provider = getattr(embed, "input_embedding_provider", None)
+        if provider is not None:
+            gen_kwargs["input_embedding_provider"] = provider
         if apc_semantic_hash is not None:
             gen_kwargs["_apc_semantic_hash"] = apc_semantic_hash
         return input_ids, gen_kwargs
@@ -1843,7 +1873,10 @@ class ResponseGenerator:
                         images,
                         apc_semantic_hash=request.apc_semantic_hash,
                     )
-                    has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
+                    has_embeds = bool(
+                        gen_kwargs.get("inputs_embeds") is not None
+                        or gen_kwargs.get("input_embedding_provider") is not None
+                    )
                     # Preserve tenant isolation for manually queued requests
                     # that predate server-side semantic hash computation.
                     if request.apc_semantic_hash is None and getattr(
@@ -1856,7 +1889,13 @@ class ResponseGenerator:
                     # admission expects all rows to carry inputs_embeds (the
                     # mixed APC path concatenates them per-row).
                     if has_embeds and any(
-                        not (s[3] and s[3].get("inputs_embeds") is not None)
+                        not (
+                            s[3]
+                            and (
+                                s[3].get("inputs_embeds") is not None
+                                or s[3].get("input_embedding_provider") is not None
+                            )
+                        )
                         for s in batch_gen.unprocessed_prompts
                     ):
                         self._flush(batch_gen, active)

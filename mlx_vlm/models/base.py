@@ -2,7 +2,7 @@ import inspect
 import math
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -68,7 +68,7 @@ class SequenceClassifierOutput:
 
 @dataclass
 class InputEmbeddingsFeatures:
-    inputs_embeds: mx.array
+    inputs_embeds: Optional[mx.array]
     attention_mask_4d: Optional[mx.array] = None
     visual_pos_masks: Optional[mx.array] = None
     deepstack_visual_embeds: Optional[mx.array] = None
@@ -81,6 +81,7 @@ class InputEmbeddingsFeatures:
     position_ids: Optional[mx.array] = None
     pos_hw: Optional[mx.array] = None
     rope_deltas: Optional[mx.array] = None
+    input_embedding_provider: Optional[Any] = None
 
     def to_dict(self):
         return {

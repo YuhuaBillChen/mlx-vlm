@@ -625,6 +625,8 @@ APC_PRIVATE_PROMPT_KEYS = (
     "_apc_semantic_hash",
 )
 
+INPUT_EMBEDDING_PROVIDER_KEY = "input_embedding_provider"
+
 
 def _is_mrope_position_ids_prompt_kwarg(key: str, v: mx.array) -> bool:
     return key == "position_ids" and v.ndim == 3 and v.shape[0] == 3
@@ -727,10 +729,22 @@ def _merge_prefill_prompt_kwargs(
     lengths = [len(ids) for ids in input_ids]
     max_length = max(lengths)
 
+    providers = [
+        kw.get(INPUT_EMBEDDING_PROVIDER_KEY) if kw else None
+        for kw in prompt_kwargs_list
+    ]
+    if any(provider is not None for provider in providers):
+        if len(prompt_kwargs_list) != 1 or providers[0] is None:
+            raise ValueError(
+                "chunk-local input embeddings currently require a single-row prefill"
+            )
+
     row_embeds: List[mx.array] = []
     embed_dtype = None
     embed_dim = None
     for kw, length in zip(prompt_kwargs_list, lengths):
+        if providers[0] is not None:
+            continue
         if not kw or kw.get("inputs_embeds") is None:
             raise ValueError("inputs_embeds is required")
         embeds = kw["inputs_embeds"]  # [1, length, D]
@@ -743,7 +757,9 @@ def _merge_prefill_prompt_kwargs(
             )
             embeds = mx.concatenate([pad, embeds], axis=1)
         row_embeds.append(embeds)
-    inputs_embeds = mx.concatenate(row_embeds, axis=0)
+    inputs_embeds = (
+        None if providers[0] is not None else mx.concatenate(row_embeds, axis=0)
+    )
 
     merged_kwargs: dict = {}
     per_row_keys: dict = {}
@@ -1729,10 +1745,13 @@ class PromptProcessingBatch:
         )
         self._inputs_embeds = inputs_embeds
         self._prompt_kwargs = prompt_kwargs or {}
+        self._input_embedding_provider = self._prompt_kwargs.pop(
+            INPUT_EMBEDDING_PROVIDER_KEY, None
+        )
         self._prompt_length_aware_keys: List[str] = []
-        if self._prompt_kwargs and self._inputs_embeds is not None:
-            prompt_batch = self._inputs_embeds.shape[0]
-            prompt_len = self._inputs_embeds.shape[1]
+        if self._prompt_kwargs:
+            prompt_batch = self._input_ids.shape[0]
+            prompt_len = self._input_ids.shape[1]
             for k, v in self._prompt_kwargs.items():
                 if (
                     isinstance(v, mx.array)
@@ -1856,13 +1875,13 @@ class PromptProcessingBatch:
 
     def needs_processing(self):
         """True if prompt needs chunked processing before generate()."""
-        if self._inputs_embeds is None or self.prefill_step_size is None:
+        if self.prefill_step_size is None:
             return self._next_apc_checkpoint_column() is not None
         if self._next_apc_checkpoint_column() is not None:
             return True
         # See the note in stream_generate: prompts at or below prefill_step_size
         # would otherwise skip chunking and materialize the full logits tensor.
-        return self._inputs_embeds.shape[1] > 1
+        return self._input_ids.shape[1] > 1
 
     def _apc_checkpoint_column_for_meta(
         self, batch_idx: int, meta: dict
@@ -1890,11 +1909,10 @@ class PromptProcessingBatch:
             self._apc_manager is None
             or not self._apc_uses_checkpoints()
             or not self._apc_meta
-            or self._inputs_embeds is None
         ):
             return None
         start = self._processed_prompt_columns
-        end = start + self._inputs_embeds.shape[1]
+        end = start + self._input_ids.shape[1]
         next_col: Optional[int] = None
         for batch_idx, meta in enumerate(self._apc_meta):
             if meta is None:
@@ -1966,25 +1984,34 @@ class PromptProcessingBatch:
         if not self.needs_processing():
             return 0
 
-        step = self.prefill_step_size or self._inputs_embeds.shape[1]
-        n = min(step, self._inputs_embeds.shape[1] - 1)
+        step = self.prefill_step_size or self._input_ids.shape[1]
+        n = min(step, self._input_ids.shape[1] - 1)
         checkpoint_col = self._next_apc_checkpoint_column()
         if checkpoint_col is not None:
             n = min(n, checkpoint_col - self._processed_prompt_columns)
         if n <= 0:
             return 0
         prompt_kwargs = self._prompt_kwargs_for_step(n)
+        if self._inputs_embeds is not None:
+            inputs_embeds = self._inputs_embeds[:, :n]
+        elif self._input_embedding_provider is not None:
+            inputs_embeds = self._input_embedding_provider(
+                self._input_ids[:, :n], start=self._processed_prompt_columns
+            )
+        else:
+            inputs_embeds = None
         self.model(
             self._input_ids[:, :n],
             cache=self.prompt_cache,
-            inputs_embeds=self._inputs_embeds[:, :n],
+            inputs_embeds=inputs_embeds,
             n_to_process=n,
             **prompt_kwargs,
         )
         mx.async_eval([c.state for c in self.prompt_cache])
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
-        self._inputs_embeds = self._inputs_embeds[:, n:]
+        if self._inputs_embeds is not None:
+            self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
         for k in self._prompt_length_aware_keys:
             self._prompt_kwargs[k] = _slice_sequence_aligned_prompt_kwarg(
@@ -2027,7 +2054,17 @@ class PromptProcessingBatch:
         output = self.model(
             self._input_ids,
             cache=self.prompt_cache,
-            inputs_embeds=self._inputs_embeds,
+            inputs_embeds=(
+                self._inputs_embeds
+                if self._inputs_embeds is not None
+                else (
+                    self._input_embedding_provider(
+                        self._input_ids, start=self._processed_prompt_columns
+                    )
+                    if self._input_embedding_provider is not None
+                    else None
+                )
+            ),
             **call_kwargs,
         )
         logits = output.logits if hasattr(output, "logits") else output
@@ -2514,22 +2551,43 @@ class BatchGenerator:
         max_suffix_len = max(suffix_lens)
         right_pad_per_row = [max_suffix_len - s for s in suffix_lens]
 
-        # Source inputs_embeds: every row's prompt_kwargs holds the full-prompt
-        # embeddings. Slice to suffix per-row, right-pad to max_suffix_len, stack.
-        suffix_embeds_per_row: List[mx.array] = []
-        for i, kw in enumerate(prompt_kwargs_list):
-            if kw is None or kw.get("inputs_embeds") is None:
-                raise ValueError("APC mixed prefill requires precomputed inputs_embeds")
-            full = kw["inputs_embeds"]  # [1, full_len, D]
-            suff = full[:, prefix_lens[i] :, :]
-            pad = right_pad_per_row[i]
-            if pad > 0:
-                pad_emb = mx.zeros(
-                    (suff.shape[0], pad, suff.shape[-1]), dtype=suff.dtype
+        providers = [
+            kw.get(INPUT_EMBEDDING_PROVIDER_KEY) if kw else None
+            for kw in prompt_kwargs_list
+        ]
+        suffix_provider = None
+        if any(provider is not None for provider in providers):
+            if len(sequences) != 1 or providers[0] is None:
+                raise ValueError(
+                    "chunk-local APC restore currently requires a single-row prefill"
                 )
-                suff = mx.concatenate([suff, pad_emb], axis=1)
-            suffix_embeds_per_row.append(suff)
-        inputs_embeds = mx.concatenate(suffix_embeds_per_row, axis=0)
+            provider = providers[0]
+            prefix_len = prefix_lens[0]
+
+            def suffix_provider(input_ids, *, start=0):
+                return provider(input_ids, start=prefix_len + start)
+
+            inputs_embeds = None
+        else:
+            # Source inputs_embeds: every row's prompt_kwargs holds the
+            # full-prompt embeddings. Slice to suffix per-row, right-pad to
+            # max_suffix_len, stack.
+            suffix_embeds_per_row: List[mx.array] = []
+            for i, kw in enumerate(prompt_kwargs_list):
+                if kw is None or kw.get("inputs_embeds") is None:
+                    raise ValueError(
+                        "APC mixed prefill requires precomputed inputs_embeds"
+                    )
+                full = kw["inputs_embeds"]  # [1, full_len, D]
+                suff = full[:, prefix_lens[i] :, :]
+                pad = right_pad_per_row[i]
+                if pad > 0:
+                    pad_emb = mx.zeros(
+                        (suff.shape[0], pad, suff.shape[-1]), dtype=suff.dtype
+                    )
+                    suff = mx.concatenate([suff, pad_emb], axis=1)
+                suffix_embeds_per_row.append(suff)
+            inputs_embeds = mx.concatenate(suffix_embeds_per_row, axis=0)
 
         # Merge prompt-side kwargs (excluding inputs_embeds, which we've just
         # rebuilt). Per-batch tensors get concatenated across rows; scalars
@@ -2546,7 +2604,10 @@ class BatchGenerator:
             prefix_len = prefix_lens[i]
             right_pad = right_pad_per_row[i]
             for k, v in kw.items():
-                if k == "inputs_embeds" or k in self._APC_PRIVATE_KEYS:
+                if (
+                    k in ("inputs_embeds", INPUT_EMBEDDING_PROVIDER_KEY)
+                    or k in self._APC_PRIVATE_KEYS
+                ):
                     continue
                 if isinstance(v, mx.array) and _prompt_kwarg_batch_size(k, v) >= 1:
                     row_v = _prompt_kwarg_row(k, v, i, batch_size)
@@ -2565,6 +2626,8 @@ class BatchGenerator:
                     merged_kwargs[k] = v
         for k, vs in per_row_keys.items():
             merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
+        if suffix_provider is not None:
+            merged_kwargs[INPUT_EMBEDDING_PROVIDER_KEY] = suffix_provider
 
         apc_mode = getattr(self, "apc_mode", "block")
         # bits + group_size + scheme so warm restore matches live _make_cache

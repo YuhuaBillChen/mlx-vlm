@@ -755,6 +755,7 @@ def _unstarted_response_generator():
     gen.defer_draft_model = False
     gen.vision_phase_swap_path = None
     gen.vision_phase_swap = None
+    gen.chunk_local_input_embeddings = False
     gen.kv_bits = None
     gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
     gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
@@ -832,6 +833,24 @@ def test_server_initializes_vision_phase_swap(monkeypatch):
 
     constructor.assert_called_once_with(model, "vision.safetensors")
     assert gen.vision_phase_swap is phase_swap
+
+
+def test_server_rejects_chunk_local_embeddings_for_unsupported_models(monkeypatch):
+    config = SimpleNamespace(model_type="qwen2_vl", eos_token_id=[])
+    model = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    gen = _unstarted_response_generator()
+    gen.chunk_local_input_embeddings = True
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+
+    with pytest.raises(ValueError, match="currently support Qwen3.5 only"):
+        gen._initialize_model()
 
 
 @pytest.mark.parametrize(
@@ -6804,6 +6823,55 @@ class TestResponseGenerator:
         assert "rope_deltas" not in gen_kwargs
         assert "_apc_semantic_hash" not in gen_kwargs
 
+    def test_gpu_embed_only_passes_chunked_for_the_opt_in_path(self):
+        class Embed:
+            input_embedding_provider = None
+
+            def to_dict(self):
+                return {"inputs_embeds": mx.zeros((1, 2, 4))}
+
+        class StrictModel:
+            def get_input_embeddings(self, input_ids, pixel_values, mask=None):
+                return Embed()
+
+        response_generator = SimpleNamespace(
+            model=StrictModel(), vision_cache=None, chunk_local_input_embeddings=False
+        )
+
+        _, gen_kwargs = server.ResponseGenerator._gpu_embed(
+            response_generator,
+            {"input_ids": mx.array([[1, 2]])},
+        )
+
+        assert gen_kwargs["inputs_embeds"].shape == (1, 2, 4)
+
+    def test_gpu_embed_forwards_chunk_local_provider(self):
+        provider = object()
+
+        class Embed:
+            input_embedding_provider = provider
+
+            def to_dict(self):
+                return {"inputs_embeds": None}
+
+        class Model:
+            def get_input_embeddings(
+                self, input_ids, pixel_values, mask=None, *, chunked=False
+            ):
+                assert chunked is True
+                return Embed()
+
+        response_generator = SimpleNamespace(
+            model=Model(), vision_cache=None, chunk_local_input_embeddings=True
+        )
+
+        _, gen_kwargs = server.ResponseGenerator._gpu_embed(
+            response_generator,
+            {"input_ids": mx.array([[1, 2]])},
+        )
+
+        assert gen_kwargs["input_embedding_provider"] is provider
+
     def test_gpu_embed_unloads_phase_swapped_vision_after_materialization(
         self, monkeypatch
     ):
@@ -7551,6 +7619,7 @@ class TestRuntimeConfigAdditions:
             "spec_draft_kind",
             "spec_defer_draft_model",
             "vision_phase_swap_path",
+            "chunk_local_input_embeddings",
         ):
             assert name in spec
             assert spec[name]["reload_kinds"] == ["text_generation"]
@@ -7612,6 +7681,7 @@ class TestRuntimeConfigAdditions:
         monkeypatch.setattr(
             server.runtime.config, "vision_phase_swap_path", "vision.safetensors"
         )
+        monkeypatch.setattr(server.runtime.config, "chunk_local_input_embeddings", True)
 
         server.get_cached_model("demo-model")
         assert FakeResponseGenerator.last_kwargs["draft_model_path"] == "draft-x"
@@ -7621,6 +7691,7 @@ class TestRuntimeConfigAdditions:
             FakeResponseGenerator.last_kwargs["vision_phase_swap_path"]
             == "vision.safetensors"
         )
+        assert FakeResponseGenerator.last_kwargs["chunk_local_input_embeddings"] is True
 
     def test_settings_patch_replace_semantics(self, client, monkeypatch):
         monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())

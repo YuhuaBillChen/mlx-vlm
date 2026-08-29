@@ -268,6 +268,14 @@ def main():
         ),
     )
     parser.add_argument(
+        "--chunk-local-input-embeddings",
+        action="store_true",
+        help=(
+            "Build supported-model input embeddings one prefill chunk at a time. "
+            "Requires --max-num-seqs 1."
+        ),
+    )
+    parser.add_argument(
         "--max-num-seqs",
         type=int,
         default=None,
@@ -339,6 +347,8 @@ def main():
         os.environ["MLX_VLM_DEFER_DRAFT_MODEL"] = "1"
     if args.vision_phase_swap_path:
         os.environ["MLX_VLM_VISION_PHASE_SWAP_PATH"] = args.vision_phase_swap_path
+    if args.chunk_local_input_embeddings:
+        os.environ["MLX_VLM_CHUNK_LOCAL_INPUT_EMBEDS"] = "1"
     if args.max_num_seqs is not None:
         os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
     if args.prefill_step_size:

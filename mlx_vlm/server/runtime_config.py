@@ -140,6 +140,14 @@ KNOBS: Tuple[
         "Standalone vision-tower weights used for request-phase loading.",
     ),
     (
+        "chunk_local_input_embeddings",
+        "bool",
+        False,
+        TEXT_KINDS,
+        None,
+        "Build supported-model input embeddings per prefill chunk.",
+    ),
+    (
         "vision_cache_size",
         "int",
         20,
@@ -215,6 +223,7 @@ class RuntimeConfig:
     spec_draft_kind: Optional[str] = None
     spec_defer_draft_model: bool = False
     vision_phase_swap_path: Optional[str] = None
+    chunk_local_input_embeddings: bool = False
     vision_cache_size: int = 20
 
     _lock: threading.Lock = field(
@@ -251,6 +260,10 @@ class RuntimeConfig:
             in ("1", "true", "yes"),
             vision_phase_swap_path=os.environ.get("MLX_VLM_VISION_PHASE_SWAP_PATH")
             or None,
+            chunk_local_input_embeddings=os.environ.get(
+                "MLX_VLM_CHUNK_LOCAL_INPUT_EMBEDS", "0"
+            ).lower()
+            in ("1", "true", "yes"),
             vision_cache_size=int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20")),
         )
         cfg._env_defaults = {name: getattr(cfg, name) for name in _KNOB_SPEC}
