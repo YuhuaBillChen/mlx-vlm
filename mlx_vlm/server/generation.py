@@ -44,6 +44,7 @@ from ..speculative.utils import speculative_stats_since, speculative_stats_snaps
 from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs, resolve_eos_token_ids
+from .draft_lifecycle import LazyDrafter
 from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -1001,6 +1002,7 @@ class ResponseGenerator:
         apc_manager: Optional["_apc.APCManager"] = None,
         draft_model_path: Optional[str] = None,
         draft_kind: Optional[str] = None,
+        defer_draft_model: bool = False,
         prefill_step_size: Optional[int] = None,
     ):
         self.model_path = model_path
@@ -1012,6 +1014,9 @@ class ResponseGenerator:
         self.vision_cache = vision_cache
         self.draft_model_path = draft_model_path
         self.draft_kind_override = draft_kind
+        self.defer_draft_model = bool(defer_draft_model) or os.environ.get(
+            "MLX_VLM_DEFER_DRAFT_MODEL", "0"
+        ).lower() in ("1", "true", "yes")
         self.draft_model = None
         self.kv_bits = kv_bits
         self.kv_key_bits = kv_key_bits
@@ -1047,6 +1052,11 @@ class ResponseGenerator:
             if prefill_step_size is None
             else int(prefill_step_size)
         )
+
+    def _unload_deferred_drafter(self) -> None:
+        unload = getattr(getattr(self, "draft_model", None), "unload", None)
+        if callable(unload):
+            unload()
 
     def stop_and_join(self, timeout: float = 10.0):
         self._stop = True
@@ -1125,6 +1135,29 @@ class ResponseGenerator:
                 draft_kind = None
             else:
                 logger.info("Drafter ready; speculative decoding enabled.")
+
+                if getattr(self, "defer_draft_model", False):
+                    if draft_kind != "mtp":
+                        raise ValueError(
+                            "Deferred drafter loading currently supports MTP only."
+                        )
+                    if get_max_num_seqs() != 1:
+                        raise ValueError(
+                            "Deferred drafter loading requires --max-num-seqs 1."
+                        )
+                    draft_model = LazyDrafter(
+                        path=draft_model_path,
+                        kind=draft_kind,
+                        config=getattr(draft_model, "config", None),
+                        loader=load_drafter,
+                        validator=validate_drafter_compatibility,
+                        target_model=model,
+                    )
+                    gc.collect()
+                    mx.clear_cache()
+                    logger.info(
+                        "MTP drafter weights released until speculative decode."
+                    )
 
         self.model = model
         self.processor = processor
@@ -1726,11 +1759,16 @@ class ResponseGenerator:
                                 info["rqueue"].put(None)
                             except Exception:
                                 pass
+                    if not active and not batch_gen.has_work:
+                        batch_gen.close()
+                        batch_gen = None
+                        self._unload_deferred_drafter()
 
                 if new_items and batch_gen is not None and not active:
                     if not batch_gen.has_work:
                         batch_gen.close()
                         batch_gen = None
+                        self._unload_deferred_drafter()
 
                 for request in new_items:
                     rqueue = request.rqueue
@@ -1828,6 +1866,14 @@ class ResponseGenerator:
                     continue
 
                 self._step(batch_gen, active)
+                if (
+                    not active
+                    and batch_gen is not None
+                    and not getattr(batch_gen, "has_work", True)
+                ):
+                    batch_gen.close()
+                    batch_gen = None
+                    self._unload_deferred_drafter()
 
             except Exception as e:
                 logger.exception("Error in generation thread")
@@ -1839,12 +1885,17 @@ class ResponseGenerator:
                 )
                 _notify_queues(error_queues.values(), e, None)
                 active.clear()
+                close_batch = getattr(batch_gen, "close", None)
+                if callable(close_batch):
+                    close_batch()
                 batch_gen = None
+                self._unload_deferred_drafter()
                 mx.clear_cache()
                 gc.collect()
 
         if batch_gen is not None and callable(getattr(batch_gen, "close", None)):
             batch_gen.close()
+        self._unload_deferred_drafter()
 
     def _run_diffusion(self):
         """GPU thread loop for diffusion models.
@@ -1996,12 +2047,21 @@ class ResponseGenerator:
         kwargs = gen_kwargs or {}
         prompt_responses, responses = batch_gen.next(**kwargs)
         self._log_prefill_progress(batch_gen, active)
+        released_prefill_inputs = False
         for prompt_response in prompt_responses:
             if prompt_response.uid in active:
                 info = active[prompt_response.uid]
                 info["prompt_tps"] = prompt_response.prompt_tps
                 info["cached_tokens"] = getattr(prompt_response, "cached_tokens", 0)
+                if (
+                    getattr(self, "defer_draft_model", False)
+                    and info.get("gen_kwargs") is not None
+                ):
+                    info["gen_kwargs"] = None
+                    released_prefill_inputs = True
                 self._log_prefill_completed(prompt_response.uid, info, prompt_response)
+        if released_prefill_inputs:
+            mx.clear_cache()
         if not responses:
             return
 

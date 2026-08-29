@@ -1550,6 +1550,10 @@ class SpeculativeGenerationBatch:
         if self._rounds_iter is not None:
             return
 
+        materialize = getattr(self.draft_model, "materialize", None)
+        if callable(materialize):
+            self.draft_model = materialize()
+
         def stop_check(seq_idx, token_id):
             return (
                 self._finished[seq_idx]

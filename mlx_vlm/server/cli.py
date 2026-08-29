@@ -251,6 +251,14 @@ def main():
         help="Override the drafter's configured block size.",
     )
     parser.add_argument(
+        "--defer-draft-model",
+        action="store_true",
+        help=(
+            "Release MTP drafter weights after startup and reload them when "
+            "decode begins. Requires --max-num-seqs 1."
+        ),
+    )
+    parser.add_argument(
         "--max-num-seqs",
         type=int,
         default=None,
@@ -318,6 +326,8 @@ def main():
         os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
     if args.draft_block_size is not None:
         os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
+    if args.defer_draft_model:
+        os.environ["MLX_VLM_DEFER_DRAFT_MODEL"] = "1"
     if args.max_num_seqs is not None:
         os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
     if args.prefill_step_size:

@@ -752,6 +752,7 @@ def _unstarted_response_generator():
     gen.draft_kind = None
     gen.draft_model_path = None
     gen.draft_kind_override = None
+    gen.defer_draft_model = False
     gen.kv_bits = None
     gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
     gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
@@ -767,6 +768,78 @@ def _unstarted_response_generator():
     gen._cancelled = set()
     gen._cancel_lock = Lock()
     return gen
+
+
+def test_server_defers_compatible_mtp_drafter_until_decode(monkeypatch):
+    target_config = SimpleNamespace(
+        model_type="qwen3_5_text",
+        hidden_size=5120,
+        eos_token_id=[],
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(config=target_config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    drafter_config = SimpleNamespace(
+        model_type="qwen3_5_mtp",
+        backbone_hidden_size=5120,
+    )
+    drafter = SimpleNamespace(config=drafter_config)
+    gen = _unstarted_response_generator()
+    gen.defer_draft_model = True
+
+    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
+    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
+    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "1")
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, target_config),
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.load_drafter",
+        lambda *_args, **_kwargs: (drafter, "mtp"),
+    )
+    monkeypatch.setattr(server_generation.mx, "clear_cache", MagicMock())
+
+    gen._initialize_model()
+
+    assert gen.draft_kind == "mtp"
+    assert isinstance(gen.draft_model, server_generation.LazyDrafter)
+    assert gen.draft_model.config is drafter_config
+    assert not gen.draft_model.loaded
+
+
+@pytest.mark.parametrize(
+    ("draft_kind", "max_num_seqs", "message"),
+    [
+        ("dflash", "1", "supports MTP only"),
+        ("mtp", "2", "requires --max-num-seqs 1"),
+    ],
+)
+def test_server_rejects_unsafe_deferred_drafter_modes(
+    monkeypatch, draft_kind, max_num_seqs, message
+):
+    config = SimpleNamespace(eos_token_id=[])
+    model = SimpleNamespace(language_model=SimpleNamespace(config=config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    drafter = SimpleNamespace(config=SimpleNamespace())
+    gen = _unstarted_response_generator()
+    gen.defer_draft_model = True
+
+    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
+    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", draft_kind)
+    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", max_num_seqs)
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.load_drafter",
+        lambda *_args, **_kwargs: (drafter, draft_kind),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        gen._initialize_model()
 
 
 def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
@@ -5824,6 +5897,28 @@ class TestResponseGenerator:
         assert item.cached_tokens == 7
         assert rqueue.get() is None
 
+    def test_step_releases_prefill_inputs_before_deferred_decode(self, monkeypatch):
+        class PromptProgressBatch:
+            def next(self, **kwargs):
+                return [SimpleNamespace(uid=1, prompt_tps=100.0, cached_tokens=0)], []
+
+        clear_cache = MagicMock()
+        monkeypatch.setattr(server_generation.mx, "clear_cache", clear_cache)
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.defer_draft_model = True
+        active = {
+            1: {
+                "gen_kwargs": {"inputs_embeds": object()},
+                "prompt_tps": None,
+                "cached_tokens": 0,
+            }
+        }
+
+        gen._step(PromptProgressBatch(), active)
+
+        assert active[1]["gen_kwargs"] is None
+        clear_cache.assert_called_once_with()
+
     def test_generate_arguments_to_generate_kwargs(self):
         processor = lambda tokens, logits: logits
         args = server.GenerationArguments(
@@ -6432,6 +6527,7 @@ class TestResponseGenerator:
             "MLX_VLM_THINKING_START_TOKEN",
             "MLX_VLM_THINKING_END_TOKEN",
             "MLX_VLM_SERVER_API_KEY",
+            "MLX_VLM_DEFER_DRAFT_MODEL",
             "PREFILL_STEP_SIZE",
             "KV_GROUP_SIZE",
             "KV_QUANT_SCHEME",
@@ -6468,6 +6564,7 @@ class TestResponseGenerator:
                 "<|END_THINKING|>",
                 "--api-key",
                 "admin-token",
+                "--defer-draft-model",
             ],
         )
         run_calls = []
@@ -6491,6 +6588,7 @@ class TestResponseGenerator:
             assert os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] == "reranker-demo"
             assert os.environ["MLX_VLM_MODEL_DISCOVERY"] == "served"
             assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
+            assert os.environ["MLX_VLM_DEFER_DRAFT_MODEL"] == "1"
             assert run_calls[0][1]["host"] == "127.0.0.1"
         finally:
             for env_var in (
@@ -6508,6 +6606,7 @@ class TestResponseGenerator:
                 "MLX_VLM_THINKING_START_TOKEN",
                 "MLX_VLM_THINKING_END_TOKEN",
                 "MLX_VLM_SERVER_API_KEY",
+                "MLX_VLM_DEFER_DRAFT_MODEL",
             ):
                 os.environ.pop(env_var, None)
 
@@ -7387,6 +7486,7 @@ class TestRuntimeConfigAdditions:
             "token_queue_timeout",
             "spec_draft_model",
             "spec_draft_kind",
+            "spec_defer_draft_model",
         ):
             assert name in spec
             assert spec[name]["reload_kinds"] == ["text_generation"]
@@ -7444,10 +7544,12 @@ class TestRuntimeConfigAdditions:
         monkeypatch.setattr(server.runtime, "apc_manager", None)
         monkeypatch.setattr(server.runtime.config, "spec_draft_model", "draft-x")
         monkeypatch.setattr(server.runtime.config, "spec_draft_kind", "auto")
+        monkeypatch.setattr(server.runtime.config, "spec_defer_draft_model", True)
 
         server.get_cached_model("demo-model")
         assert FakeResponseGenerator.last_kwargs["draft_model_path"] == "draft-x"
         assert FakeResponseGenerator.last_kwargs["draft_kind"] == "auto"
+        assert FakeResponseGenerator.last_kwargs["defer_draft_model"] is True
 
     def test_settings_patch_replace_semantics(self, client, monkeypatch):
         monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
