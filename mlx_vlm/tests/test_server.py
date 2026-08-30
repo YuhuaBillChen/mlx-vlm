@@ -6557,6 +6557,7 @@ class TestResponseGenerator:
         assert args.thinking_end_token == "</think>"
 
     def test_server_cli_sets_thinking_defaults(self, monkeypatch):
+        previous_runtime_config = server.runtime.config
         for env_var in (
             "MLX_VLM_ENABLE_THINKING",
             "MLX_VLM_PRELOAD_MODEL",
@@ -6601,6 +6602,10 @@ class TestResponseGenerator:
                 "reranker-demo",
                 "--model-discovery",
                 "served",
+                "--kv-bits",
+                "4",
+                "--kv-quant-scheme",
+                "turboquant",
                 "--enable-thinking",
                 "--thinking-budget",
                 "128",
@@ -6638,8 +6643,11 @@ class TestResponseGenerator:
             assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
             assert os.environ["MLX_VLM_DEFER_DRAFT_MODEL"] == "1"
             assert os.environ["MLX_VLM_VISION_PHASE_SWAP_PATH"] == "vision.safetensors"
+            assert server.runtime.config.kv_bits == 4
+            assert server.runtime.config.kv_quant_scheme == "turboquant"
             assert run_calls[0][1]["host"] == "127.0.0.1"
         finally:
+            server.runtime.config = previous_runtime_config
             for env_var in (
                 "MLX_VLM_ENABLE_THINKING",
                 "MLX_VLM_PRELOAD_MODEL",
@@ -6657,6 +6665,11 @@ class TestResponseGenerator:
                 "MLX_VLM_SERVER_API_KEY",
                 "MLX_VLM_DEFER_DRAFT_MODEL",
                 "MLX_VLM_VISION_PHASE_SWAP_PATH",
+                "KV_BITS",
+                "KV_GROUP_SIZE",
+                "KV_QUANT_SCHEME",
+                "QUANTIZED_KV_START",
+                "PREFILL_STEP_SIZE",
             ):
                 os.environ.pop(env_var, None)
 

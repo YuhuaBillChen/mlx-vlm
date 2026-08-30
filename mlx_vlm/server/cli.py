@@ -18,7 +18,8 @@ from .generation import (
     get_server_thinking_end_token,
     get_server_thinking_start_token,
 )
-from .runtime import MODEL_DISCOVERY_ENV, MODEL_DISCOVERY_MODES
+from .runtime import MODEL_DISCOVERY_ENV, MODEL_DISCOVERY_MODES, runtime
+from .runtime_config import RuntimeConfig
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -383,6 +384,11 @@ def main():
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
     if args.api_key:
         os.environ["MLX_VLM_SERVER_API_KEY"] = args.api_key
+
+    # ``python -m mlx_vlm.server`` imports the package (and constructs the
+    # shared runtime) before this CLI has translated arguments into environment
+    # variables. Refresh the snapshot so startup uses the requested settings.
+    runtime.config = RuntimeConfig.from_env()
 
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(
