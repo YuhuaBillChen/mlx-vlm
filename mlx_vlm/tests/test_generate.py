@@ -56,7 +56,7 @@ def test_turboquant_decode_reserve_is_layerwise_and_opt_in(monkeypatch):
     monkeypatch.setattr(
         ar_module.mx, "clear_cache", lambda: events.append(("clear",))
     )
-    caches = [Reservable(0), object(), Reservable(1)]
+    caches = [CacheList(Reservable(0), object()), Reservable(1)]
 
     assert ar_module._reserve_turboquant_decode_capacity(caches, 512) == 0
     assert events == []
