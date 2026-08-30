@@ -5209,6 +5209,23 @@ class _TurboQuantAttentionMixin:
             _QuantizedStateProxy(vs, self.offset, n_heads),
         )
 
+    def reserve_for_append(self, tokens: int) -> int:
+        """Reserve packed storage without changing the logical cache offset."""
+        tokens = max(0, int(tokens))
+        if self.keys is None or tokens == 0:
+            return _state_length(self.keys) if self.keys is not None else 0
+        needed = self.offset + tokens
+        self.keys = _reserve_state_capacity(
+            self.keys, self.offset, needed, self.cache_step
+        )
+        self.values = _reserve_state_capacity(
+            self.values, self.offset, needed, self.cache_step
+        )
+        mx.eval(self.keys, self.values)
+        self._cached_state = None
+        self._cached_state_offset = -1
+        return _state_length(self.keys)
+
     @staticmethod
     def _unwrap(state):
         return state._state if isinstance(state, _QuantizedStateProxy) else state
@@ -6535,6 +6552,21 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
             _QuantizedStateProxy(ks, self._idx, n_heads),
             _QuantizedStateProxy(vs, self._idx, n_heads),
         )
+
+    def reserve_for_append(self, tokens: int) -> int:
+        """Reserve packed storage without changing per-row cache offsets."""
+        tokens = max(0, int(tokens))
+        if self.keys is None or tokens == 0:
+            return _state_length(self.keys) if self.keys is not None else 0
+        needed = self._idx + tokens
+        self.keys = _reserve_state_capacity(
+            self.keys, self._idx, needed, self.cache_step
+        )
+        self.values = _reserve_state_capacity(
+            self.values, self._idx, needed, self.cache_step
+        )
+        mx.eval(self.keys, self.values)
+        return _state_length(self.keys)
 
     def zero_row_tail(self, bi: int, start: int, end: int):
         if start >= end:

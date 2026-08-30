@@ -61,6 +61,32 @@ DEFAULT_TOP_N_SIGMA = 0.0
 DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
 
 
+def _reserve_turboquant_decode_capacity(prompt_cache, max_tokens: int) -> int:
+    """Pre-grow TurboQuant caches one layer at a time before decode."""
+    if os.environ.get("MLX_VLM_TQ_RESERVE_DECODE") != "1":
+        return 0
+    max_tokens = max(0, int(max_tokens))
+    if max_tokens == 0:
+        return 0
+    reserved = 0
+    started = time.perf_counter()
+    for cache_entry in prompt_cache:
+        reserve = getattr(cache_entry, "reserve_for_append", None)
+        if not callable(reserve):
+            continue
+        reserve(max_tokens)
+        reserved += 1
+        mx.clear_cache()
+    if reserved:
+        logger.info(
+            "TurboQuant decode reserve completed: layers=%d tokens=%d elapsed=%.3fs",
+            reserved,
+            max_tokens,
+            time.perf_counter() - started,
+        )
+    return reserved
+
+
 def _get_batch_cache_eval_interval() -> int:
     raw = os.environ.get("MLX_VLM_BATCH_CACHE_EVAL_INTERVAL")
     if raw is None:
@@ -2253,6 +2279,10 @@ class PromptProcessingBatch:
                 for meta in self._apc_meta:
                     if meta is not None:
                         self._apc_manager.release(meta.get("apc_blocks", []))
+
+        _reserve_turboquant_decode_capacity(
+            self.prompt_cache, max(self.max_tokens, default=0)
+        )
 
         self.uids = []
         self.prompt_cache = []

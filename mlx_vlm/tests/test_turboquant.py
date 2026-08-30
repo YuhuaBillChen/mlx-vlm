@@ -8,6 +8,7 @@ from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
     _build_codec,
+    _state_length,
     _TurboQuantMSECodec,
     _TurboQuantProdCodec,
     resolve_kv_bits,
@@ -538,6 +539,39 @@ def test_resolve_kv_bits_validates_overrides():
         resolve_kv_bits(4, 0.5, None)
     with pytest.raises(ValueError):
         resolve_kv_bits(4, None, 3.25)
+
+
+def test_turboquant_reserve_for_append_preserves_state_and_offset():
+    cache = TurboQuantKVCache(bits=4)
+    keys = mx.random.normal((1, 4, 17, 256)).astype(mx.bfloat16)
+    values = mx.random.normal((1, 4, 17, 256)).astype(mx.bfloat16)
+    cache.update_and_fetch(keys, values)
+    before_keys, before_values = cache.dequantize()
+
+    capacity = cache.reserve_for_append(300)
+    after_keys, after_values = cache.dequantize()
+    mx.eval(before_keys, before_values, after_keys, after_values)
+
+    assert cache.offset == 17
+    assert capacity == 512
+    assert _state_length(cache.keys) == 512
+    assert mx.array_equal(before_keys, after_keys)
+    assert mx.array_equal(before_values, after_values)
+
+
+def test_batch_turboquant_reserve_for_append_preserves_offsets():
+    cache = BatchTurboQuantKVCache([2, 0], bits=4)
+    keys = mx.random.normal((2, 4, 17, 256)).astype(mx.bfloat16)
+    values = mx.random.normal((2, 4, 17, 256)).astype(mx.bfloat16)
+    cache.update_and_fetch(keys, values)
+    before_offsets = cache.offset.tolist()
+
+    capacity = cache.reserve_for_append(300)
+
+    assert cache.offset.tolist() == before_offsets
+    assert cache._idx == 17
+    assert capacity == 512
+    assert _state_length(cache.keys) == 512
 
 
 def test_asymmetric_bits_build_matching_codecs():

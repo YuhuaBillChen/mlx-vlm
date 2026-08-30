@@ -42,6 +42,34 @@ from mlx_vlm.utils import ThinkingBudgetCriteria
 generate_module = sys.modules["mlx_vlm.generate"]
 image_module = __import__("mlx_vlm.generate.image", fromlist=[""])
 
+
+def test_turboquant_decode_reserve_is_layerwise_and_opt_in(monkeypatch):
+    events = []
+
+    class Reservable:
+        def __init__(self, layer):
+            self.layer = layer
+
+        def reserve_for_append(self, tokens):
+            events.append(("reserve", self.layer, tokens))
+
+    monkeypatch.setattr(
+        ar_module.mx, "clear_cache", lambda: events.append(("clear",))
+    )
+    caches = [Reservable(0), object(), Reservable(1)]
+
+    assert ar_module._reserve_turboquant_decode_capacity(caches, 512) == 0
+    assert events == []
+
+    monkeypatch.setenv("MLX_VLM_TQ_RESERVE_DECODE", "1")
+    assert ar_module._reserve_turboquant_decode_capacity(caches, 512) == 2
+    assert events == [
+        ("reserve", 0, 512),
+        ("clear",),
+        ("reserve", 1, 512),
+        ("clear",),
+    ]
+
 # ============================================================================
 # Fixtures and Mock Classes
 # ============================================================================
