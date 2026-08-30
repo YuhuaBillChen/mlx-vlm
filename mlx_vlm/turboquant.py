@@ -13,6 +13,14 @@ from .models.cache import _BaseCache, create_attention_mask, create_causal_mask
 DEFAULT_TURBOQUANT_SEED = 0
 _EPS = 1e-6
 _POLAR_MAX_LEVELS = 4
+_MTP_VERIFY_MAX_APPEND = 15
+
+
+def _should_eval_cache_append(n_new: int, offset: int) -> bool:
+    """Bound prefill graphs without synchronizing each small MTP verify append."""
+    lazy_verify = os.environ.get("MLX_VLM_TQ_LAZY_VERIFY_APPEND") == "1"
+    is_small_verify = lazy_verify and 1 < n_new <= _MTP_VERIFY_MAX_APPEND
+    return (n_new > 1 and not is_small_verify) or (offset % 50 == 0)
 
 
 def _metal_available() -> bool:
@@ -5193,7 +5201,7 @@ class _TurboQuantAttentionMixin:
         self.offset = new_end
         self._cached_state = None
         self._cached_state_offset = -1
-        if n_new > 1 or (self.offset % 50 == 0):
+        if _should_eval_cache_append(n_new, self.offset):
             mx.eval(self.keys, self.values)
         ks, vs = self.state
         return (
@@ -6312,7 +6320,7 @@ class TurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         self.offset = new_end
         self._cached_state = None
         self._cached_state_offset = -1
-        if n_new > 1 or (self.offset % 50 == 0):
+        if _should_eval_cache_append(n_new, self.offset):
             mx.eval(self.keys, self.values)
         ks, vs = self.state
         return (
@@ -6517,7 +6525,7 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         self.offset += keys.shape[2]
         self._idx = new_end
 
-        if keys.shape[2] > 1 or (self._idx % 50 == 0):
+        if _should_eval_cache_append(keys.shape[2], self._idx):
             mx.eval(self.keys, self.values)
 
         ks = _slice_state(self.keys, self._idx)

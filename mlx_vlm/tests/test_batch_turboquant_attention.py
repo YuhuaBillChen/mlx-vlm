@@ -17,11 +17,24 @@ from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
     _TurboQuantAttentionMixin,
+    _should_eval_cache_append,
 )
 
 H, D = 4, 64  # kv heads, head_dim
 BITS = 4
 SCALE = D**-0.5
+
+
+def test_small_mtp_append_can_stay_lazy(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_TQ_LAZY_VERIFY_APPEND", "1")
+    assert not _should_eval_cache_append(3, 40363)
+    assert _should_eval_cache_append(3, 40400)
+    assert _should_eval_cache_append(16, 40363)
+
+
+def test_original_eval_policy_is_default(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_TQ_LAZY_VERIFY_APPEND", raising=False)
+    assert _should_eval_cache_append(3, 40363)
 
 
 def _rand_kv(batch, seq_len, heads=H):
