@@ -71,8 +71,10 @@ def _reserve_turboquant_decode_capacity(prompt_cache, max_tokens: int) -> int:
     reserved = 0
     started = time.perf_counter()
     pending = list(prompt_cache)
+    cache_types = []
     while pending:
         cache_entry = pending.pop(0)
+        cache_types.append(type(cache_entry).__name__)
         reserve = getattr(cache_entry, "reserve_for_append", None)
         if not callable(reserve):
             if isinstance(cache_entry, cache.CacheList):
@@ -89,7 +91,10 @@ def _reserve_turboquant_decode_capacity(prompt_cache, max_tokens: int) -> int:
             time.perf_counter() - started,
         )
     else:
-        logger.warning("TurboQuant decode reserve requested but no cache supports it")
+        logger.warning(
+            "TurboQuant decode reserve requested but no cache supports it: types=%s",
+            sorted(set(cache_types)),
+        )
     return reserved
 
 
