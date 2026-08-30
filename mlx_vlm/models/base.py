@@ -393,7 +393,9 @@ def scaled_dot_product_attention(
             )
             if result is not None:
                 return result
-        dequantized_keys, dequantized_values = cache.dequantize(keys, values)
+        dequantized_keys, dequantized_values = cache.dequantize_for_attention(
+            keys, values
+        )
         return mx.fast.scaled_dot_product_attention(
             queries,
             dequantized_keys.astype(queries.dtype),

@@ -151,6 +151,34 @@ class TestNumericalEquivalence:
         mx.eval(out, reference)
         assert mx.allclose(out, reference, atol=2e-2).item()
 
+    @pytest.mark.skipif(not hasattr(mx, "metal"), reason="requires Metal kernels")
+    def test_fused_dequantize_matches_current_path(self, monkeypatch):
+        cache, keys, values = _filled([0], 300)
+        monkeypatch.delenv("MLX_VLM_TQ_FUSED_DEQUANT", raising=False)
+        reference_k, reference_v = cache.dequantize(keys, values)
+        monkeypatch.setenv("MLX_VLM_TQ_FUSED_DEQUANT", "1")
+        fused_k, fused_v = cache.dequantize_for_attention(keys, values)
+        mx.eval(reference_k, reference_v, fused_k, fused_v)
+
+        assert fused_k.dtype == mx.float16
+        assert fused_v.dtype == mx.float16
+        assert mx.allclose(fused_k, reference_k, atol=2e-3).item()
+        assert mx.allclose(fused_v, reference_v, atol=2e-3).item()
+
+    @pytest.mark.skipif(not hasattr(mx, "metal"), reason="requires Metal kernels")
+    def test_attention_fallback_uses_fused_dequantize(self, monkeypatch):
+        cache, keys, values = _filled([0, 0], 300)
+        queries = mx.random.normal((2, H, 3, D))
+        monkeypatch.setenv("MLX_VLM_TQ_FUSED_DEQUANT", "1")
+
+        out = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=SCALE, mask=None
+        )
+        reference = self._reference(cache, queries, keys, values)
+        mx.eval(out, reference)
+
+        assert mx.allclose(out, reference, atol=2e-2).item()
+
 
 class TestShapesBeyondTheDefaultLayout:
     """The fused path has to survive head geometries other than the default.

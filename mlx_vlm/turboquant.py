@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from functools import lru_cache
 from typing import NamedTuple, Optional, Tuple
 
@@ -2693,6 +2694,45 @@ def _metal_butterfly_wht_inverse(
 
 
 @lru_cache(maxsize=None)
+def _fused_mse_dequantize_rht_kernel(bits: int, dim: int):
+    """Unpack, codebook-decode, rescale, and inverse-RHT in one dispatch."""
+    if not _metal_available() or bits < 1 or dim < 32 or not _is_power_of_two(dim):
+        return None
+
+    mask = (1 << bits) - 1
+    inverse = _metal_butterfly_wht_inverse("shared", "signs", "temp")
+    source = "\n".join(
+        [
+            "        auto lane = thread_index_in_simdgroup;",
+            "        auto n = threadgroup_position_in_grid.y;",
+            "        threadgroup float shared[Dim];",
+            "        float temp[DimsPerLane];",
+            "        auto src = packed + n * PackedWidth;",
+            "        float norm = static_cast<float>(norms[n]);",
+            "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {",
+            f"            int bit = d * {bits};",
+            "            int word = bit >> 5;",
+            "            int off = bit & 31;",
+            "            uint code = src[word] >> off;",
+            f"            if (off + {bits} > 32)",
+            "                code |= src[word + 1] << (32 - off);",
+            f"            shared[d] = codebook[code & {mask}u] * norm;",
+            "        }",
+            "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+            *inverse,
+            "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32)",
+            "            out[n * Dim + d] = static_cast<half>(shared[d]);",
+        ]
+    )
+    return mx.fast.metal_kernel(
+        name=f"turboquant_mse_dequant_rht_{bits}b_d{dim}",
+        input_names=["packed", "norms", "codebook", "signs"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
 def _fused_kv_quantize_kernel(key_bits: int, val_bits: int):
     """Fused key+value quantize in 1 dispatch."""
     if not _metal_available() or key_bits <= 0 or val_bits <= 0:
@@ -5174,6 +5214,49 @@ class _TurboQuantAttentionMixin:
         state = self.state
         return state[0], state[1]
 
+    def _fused_mse_dequantize_pair(self, keys_state, values_state):
+        if not (
+            isinstance(self.key_codec, _TurboQuantMSECodec)
+            and isinstance(self.value_codec, _TurboQuantMSECodec)
+            and self.key_codec.use_rht
+            and self.value_codec.use_rht
+            and isinstance(keys_state, TurboQuantMSEState)
+            and isinstance(values_state, TurboQuantMSEState)
+            and self.key_codec.dim == self.value_codec.dim
+        ):
+            return None
+
+        dim = self.key_codec.dim
+
+        def launch(codec, state):
+            bits = int(codec.bits)
+            if bits != codec.bits:
+                return None
+            kernel = _fused_mse_dequantize_rht_kernel(bits, dim)
+            if kernel is None:
+                return None
+            vectors = math.prod(state.norms.shape)
+            return kernel(
+                inputs=[state.indices, state.norms, codec.codebook, codec.signs],
+                template=[
+                    ("Dim", dim),
+                    ("DimPadded", dim),
+                    ("DimsPerLane", dim // 32),
+                    ("DimsPerLanePadded", dim // 32),
+                    ("PackedWidth", state.indices.shape[-1]),
+                ],
+                grid=(32, vectors, 1),
+                threadgroup=(32, 1, 1),
+                output_shapes=[(*state.norms.shape, dim)],
+                output_dtypes=[mx.float16],
+            )[0]
+
+        keys = launch(self.key_codec, keys_state)
+        values = launch(self.value_codec, values_state)
+        if keys is None or values is None:
+            return None
+        return keys, values
+
     def _apply_attention_mask(
         self,
         scores: mx.array,
@@ -6246,6 +6329,17 @@ class TurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         values = self.value_codec.dequantize(values_state).astype(mx.float32)
         return keys, values
 
+    def dequantize_for_attention(self, keys_state=None, values_state=None):
+        if keys_state is None or values_state is None:
+            keys_state, values_state = self._attention_states()
+        keys_state = self._unwrap(keys_state)
+        values_state = self._unwrap(values_state)
+        if os.environ.get("MLX_VLM_TQ_FUSED_DEQUANT") == "1":
+            fused = self._fused_mse_dequantize_pair(keys_state, values_state)
+            if fused is not None:
+                return fused
+        return self.dequantize(keys_state, values_state)
+
     def dequantize_for_apc(self):
         """Return raw float (keys, values) for APC storage.
 
@@ -6551,6 +6645,18 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         k = self.key_codec.dequantize(keys_state).astype(mx.float32)
         v = self.value_codec.dequantize(values_state).astype(mx.float32)
         return k, v
+
+    def dequantize_for_attention(self, keys_state=None, values_state=None):
+        if keys_state is None or values_state is None:
+            keys_state = _slice_state(self.keys, self._idx)
+            values_state = _slice_state(self.values, self._idx)
+        keys_state = self._unwrap(keys_state)
+        values_state = self._unwrap(values_state)
+        if os.environ.get("MLX_VLM_TQ_FUSED_DEQUANT") == "1":
+            fused = self._fused_mse_dequantize_pair(keys_state, values_state)
+            if fused is not None:
+                return fused
+        return self.dequantize(keys_state, values_state)
 
     def dequantize_for_apc(self):
         """Return raw float (keys, values) for APC storage.
