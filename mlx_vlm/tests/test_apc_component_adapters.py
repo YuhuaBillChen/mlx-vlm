@@ -255,6 +255,32 @@ def test_checkpoint_coordinator_borrows_only_for_direct_disk_write(monkeypatch):
     assert captured["detach"] is False
 
 
+def test_checkpoint_coordinator_does_not_store_completed_checkpoint():
+    from types import SimpleNamespace
+
+    from mlx_vlm.apc_coordinator import APCCoordinator
+
+    class Hybrid:
+        def make_cache(self):
+            return [C.KVCache(), C.ArraysCache(2)]
+
+    calls = []
+    manager = SimpleNamespace(
+        release=lambda blocks: calls.append(("release", tuple(blocks))),
+        store_exact_cache=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    coordinator = APCCoordinator(manager, Hybrid())
+
+    assert coordinator.commit(
+        [object()],
+        list(range(32)),
+        checkpoint_stored=True,
+        blocks_in_use=(object(),),
+    )
+    assert len(calls) == 1
+    assert calls[0][0] == "release"
+
+
 def test_registry_eligibility_helpers():
     from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 

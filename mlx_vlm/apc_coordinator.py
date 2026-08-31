@@ -177,6 +177,7 @@ class APCCoordinator:
         prompt_cache: Sequence[Any],
         token_ids: Sequence[int],
         *,
+        checkpoint_stored: bool = False,
         batch_idx: Optional[int] = None,
         extra_hash: int = 0,
         skip_first_n_tokens: int = 0,
@@ -187,6 +188,8 @@ class APCCoordinator:
             return False
         if self.is_checkpoint:
             try:
+                if checkpoint_stored:
+                    return True
                 return self.store_checkpoint(
                     token_ids,
                     prompt_cache,

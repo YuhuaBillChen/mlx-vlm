@@ -819,6 +819,35 @@ class TestBatchGenerator:
         eval_mock.assert_not_called()
         batch._store_apc_exact_checkpoints.assert_called_once_with()
 
+    def test_prompt_step_syncs_only_for_direct_exact_disk_checkpoint(self, monkeypatch):
+        cache_state = mx.array([1])
+        batch = PromptProcessingBatch(
+            model=MagicMock(),
+            uids=[1],
+            input_ids=[[1, 2, 3, 4, 5]],
+            max_tokens=[1],
+            inputs_embeds=mx.ones((1, 5, 4)),
+            prompt_kwargs={},
+            prefill_step_size=2,
+            warm_cache=[SimpleNamespace(state=cache_state)],
+        )
+        batch._next_apc_checkpoint_column = lambda: 2
+        batch._apc_manager = SimpleNamespace(direct_disk_writes=True)
+        batch._store_apc_exact_checkpoints = MagicMock()
+        eval_mock = MagicMock()
+        async_eval_mock = MagicMock()
+        clear_mock = MagicMock()
+        monkeypatch.setattr(ar_module.mx, "eval", eval_mock)
+        monkeypatch.setattr(ar_module.mx, "async_eval", async_eval_mock)
+        monkeypatch.setattr(ar_module.mx, "clear_cache", clear_mock)
+
+        assert batch.prompt_step() == 2
+
+        eval_mock.assert_called_once_with([cache_state])
+        async_eval_mock.assert_not_called()
+        assert clear_mock.call_count == 2
+        batch._store_apc_exact_checkpoints.assert_called_once_with()
+
     def test_response_dataclass(self):
         response = GenerationBatch.Response(
             uid=0, token=42, token_logprob=-0.5, finish_reason="stop"

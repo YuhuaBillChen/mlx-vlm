@@ -1990,7 +1990,7 @@ class PromptProcessingBatch:
                 continue
             coordinator = getattr(self, "_apc_coordinator", None)
             if coordinator is not None:
-                coordinator.store_checkpoint(
+                stored = coordinator.store_checkpoint(
                     meta["full_input_ids"][:checkpoint_len],
                     self.prompt_cache,
                     extra_hash=meta.get("extra_hash", 0),
@@ -2000,13 +2000,13 @@ class PromptProcessingBatch:
                 prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
                 if prompt_cache is None:
                     continue
-                self._apc_manager.store_exact_cache(
+                stored = self._apc_manager.store_exact_cache(
                     meta["full_input_ids"][:checkpoint_len],
                     prompt_cache,
                     extra_hash=meta.get("extra_hash", 0),
                     take_ownership=True,
                 )
-            meta["checkpoint_done"] = True
+            meta["checkpoint_done"] = bool(stored)
 
     def _prompt_kwargs_for_step(self, n: Optional[int] = None) -> dict:
         if n is None or not self._prompt_length_aware_keys:
@@ -2044,7 +2044,22 @@ class PromptProcessingBatch:
             n_to_process=n,
             **prompt_kwargs,
         )
-        mx.async_eval([c.state for c in self.prompt_cache])
+        cache_states = [c.state for c in self.prompt_cache]
+        direct_checkpoint = bool(
+            checkpoint_col is not None
+            and self._processed_prompt_columns + n == checkpoint_col
+            and self._apc_manager is not None
+            and getattr(self._apc_manager, "direct_disk_writes", False)
+        )
+        if direct_checkpoint:
+            # The direct disk writer borrows live cache views. Finish the final
+            # prefill graph and release chunk-local inputs before serialization
+            # so their activation lifetime does not overlap the checkpoint.
+            mx.eval(cache_states)
+            del inputs_embeds, prompt_kwargs
+            mx.clear_cache()
+        else:
+            mx.async_eval(cache_states)
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
         if self._inputs_embeds is not None:
@@ -2259,6 +2274,7 @@ class PromptProcessingBatch:
                         coordinator.commit(
                             self.prompt_cache,
                             meta["full_input_ids"],
+                            checkpoint_stored=bool(meta.get("checkpoint_done")),
                             batch_idx=batch_idx,
                             extra_hash=meta.get("extra_hash", 0),
                             skip_first_n_tokens=meta.get("prefix_len", 0),
