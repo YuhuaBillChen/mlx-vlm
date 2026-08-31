@@ -2493,6 +2493,30 @@ class DiskBlockStore:
         )
         self._enqueue_exact_snapshot(snapshot)
 
+    def save_exact_cache_sync(
+        self,
+        cache_hash: int,
+        token_ids: Sequence[int],
+        extra_hash: int,
+        prompt_cache: Sequence[Any],
+    ) -> None:
+        """Serialize borrowed cache views before generation can mutate them."""
+        token_tuple = tuple(int(t) for t in token_ids)
+        if not token_tuple or not prompt_cache:
+            return
+        snapshot = _DiskExactCacheSnapshot(
+            cache_hash=int(cache_hash),
+            token_ids=token_tuple,
+            extra_hash=int(extra_hash),
+            prompt_cache=list(prompt_cache),
+        )
+        path = self._shard_path(self._exact_id_for(int(cache_hash)))
+        if path.exists():
+            with self._index_lock:
+                self._exact_index.setdefault(int(cache_hash), path)
+            return
+        self._write_exact_cache_snapshot(path, snapshot)
+
     def save_layer_major_blocks(
         self,
         blocks: List[_DiskLayerMajorBlock],
@@ -3080,6 +3104,16 @@ class APCManager:
             0, int(os.environ.get("APC_LAYER_MAJOR_MEMORY_MIN_TOKENS", "50000"))
         )
 
+    @property
+    def disk_only(self) -> bool:
+        """Whether exact checkpoints persist only in the disk tier."""
+        return self.disk is not None and self._exact_cache_max <= 0
+
+    @property
+    def direct_disk_writes(self) -> bool:
+        """Whether disk-only exact APC may synchronously borrow live views."""
+        return self.disk_only and _env_truthy("APC_EXACT_DIRECT_DISK_WRITE")
+
     def _record_disk_writes(self, count: int) -> None:
         with self.lock:
             self.stats.disk_writes += int(count)
@@ -3311,6 +3345,29 @@ class APCManager:
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
+        if self.direct_disk_writes:
+            key = _sequence_hash(token_tuple, extra_hash, self.block_size)
+            try:
+                self.disk.save_exact_cache_sync(
+                    key, token_tuple, extra_hash, prompt_cache
+                )
+            except Exception as e:
+                logger.warning("APC exact synchronous disk save failed: %s", e)
+                return False
+            finally:
+                mx.clear_cache()
+            with self.lock:
+                self.stats.disk_writes += 1
+                self.stats.exact_stores += 1
+            apc_trace(
+                "store",
+                mode="exact_direct_disk",
+                ok=True,
+                token_len=len(token_tuple),
+                layers=len(prompt_cache),
+            )
+            return True
+
         copied = (
             list(prompt_cache)
             if take_ownership
@@ -4173,19 +4230,26 @@ def make_warm_batch_exact_cache_multi(
 def extract_prompt_cache_from_batch(
     batch_caches: Sequence[Any],
     batch_idx: int,
+    *,
+    detach: bool = True,
 ) -> Optional[List[Any]]:
     """Extract one row from batch-aware caches as single-row cache objects."""
 
     out: List[Any] = []
     eval_targets: List[mx.array] = []
     for c in batch_caches:
-        extract = getattr(c, "extract", None)
+        extract = (
+            getattr(c, "extract", None)
+            if detach
+            else getattr(c, "extract_view", getattr(c, "extract", None))
+        )
         if not callable(extract):
             return None
         extracted = extract(batch_idx)
         out.append(extracted)
-        _collect_mx_arrays(extracted.state, eval_targets)
-    if eval_targets:
+        if detach:
+            _collect_mx_arrays(extracted.state, eval_targets)
+    if detach and eval_targets:
         mx.eval(eval_targets)
     return out
 
@@ -4211,6 +4275,7 @@ def snapshot_prompt_cache_row(
     batch_idx: int = 0,
     *,
     min_capacity_tokens: Optional[int] = None,
+    detach: bool = True,
 ) -> Optional[List[Any]]:
     """Row-normalize a prompt cache for APC store/lookup.
 
@@ -4223,10 +4288,12 @@ def snapshot_prompt_cache_row(
         return []
     source: Sequence[Any] = caches
     if _prompt_cache_is_batch_shaped(caches):
-        row = extract_prompt_cache_from_batch(caches, batch_idx)
+        row = extract_prompt_cache_from_batch(caches, batch_idx, detach=detach)
         if row is None:
             return None
         source = row
+    if not detach:
+        return list(source)
     return _clone_prompt_cache_for_apc(source, min_capacity_tokens=min_capacity_tokens)
 
 

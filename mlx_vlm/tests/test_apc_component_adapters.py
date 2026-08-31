@@ -197,12 +197,19 @@ def test_checkpoint_coordinator_transfers_detached_snapshot(monkeypatch):
         def make_cache(self):
             return [C.KVCache(), C.ArraysCache(2)]
 
+    captured = {}
     calls = []
     manager = SimpleNamespace(
-        store_exact_cache=lambda *args, **kwargs: calls.append((args, kwargs)) or True
+        direct_disk_writes=False,
+        store_exact_cache=lambda *args, **kwargs: calls.append((args, kwargs)) or True,
     )
     snapshot = [object()]
-    monkeypatch.setattr(apc, "snapshot_prompt_cache_row", lambda *args: snapshot)
+
+    def make_snapshot(*args, **kwargs):
+        captured.update(kwargs)
+        return snapshot
+
+    monkeypatch.setattr(apc, "snapshot_prompt_cache_row", make_snapshot)
     coordinator = APCCoordinator(manager, Hybrid())
 
     assert coordinator.store_checkpoint(
@@ -218,6 +225,34 @@ def test_checkpoint_coordinator_transfers_detached_snapshot(monkeypatch):
             {"extra_hash": 7, "take_ownership": True},
         )
     ]
+    assert captured["detach"] is True
+
+
+def test_checkpoint_coordinator_borrows_only_for_direct_disk_write(monkeypatch):
+    from types import SimpleNamespace
+
+    from mlx_vlm import apc
+    from mlx_vlm.apc_coordinator import APCCoordinator
+
+    class Hybrid:
+        def make_cache(self):
+            return [C.KVCache(), C.ArraysCache(2)]
+
+    captured = {}
+    manager = SimpleNamespace(
+        direct_disk_writes=True,
+        store_exact_cache=lambda *args, **kwargs: True,
+    )
+
+    def snapshot(*args, **kwargs):
+        captured.update(kwargs)
+        return [object()]
+
+    monkeypatch.setattr(apc, "snapshot_prompt_cache_row", snapshot)
+    coordinator = APCCoordinator(manager, Hybrid())
+
+    assert coordinator.store_checkpoint(list(range(32)), [object()])
+    assert captured["detach"] is False
 
 
 def test_registry_eligibility_helpers():

@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import mlx.core as mx
 import numpy as np
@@ -79,6 +80,64 @@ def test_hash_chain_and_image_hash_are_deterministic():
     assert hash_image_payload(image_ref=["a.png", "b.png"]) == hash_image_payload(
         image_ref=["a.png", "b.png"]
     )
+
+
+def test_direct_exact_disk_write_is_explicit_and_borrows_input(monkeypatch):
+    class Disk:
+        def __init__(self):
+            self.saved = None
+
+        def set_write_callbacks(self, *_args):
+            pass
+
+        def save_exact_cache_sync(self, *args):
+            self.saved = args
+
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "0")
+    monkeypatch.setenv("APC_EXACT_DIRECT_DISK_WRITE", "1")
+    disk = Disk()
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    source = [Mock(name="borrowed-cache")]
+
+    assert manager.direct_disk_writes
+    assert manager.store_exact_cache(list(range(16)), source)
+    assert disk.saved is not None
+    assert disk.saved[3][0] is source[0]
+    assert manager.stats.exact_stores == 1
+
+
+def test_direct_exact_disk_write_requires_disk_only_mode(monkeypatch):
+    disk = Mock()
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "1")
+    monkeypatch.setenv("APC_EXACT_DIRECT_DISK_WRITE", "1")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+
+    assert not manager.direct_disk_writes
+
+
+def test_direct_exact_disk_write_roundtrip_is_immediately_visible(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "0")
+    monkeypatch.setenv("APC_EXACT_DIRECT_DISK_WRITE", "1")
+    token_ids = list(range(40))
+    source = _make_exact_row_cache(len(token_ids))
+
+    disk = DiskBlockStore(tmp_path, namespace="direct-exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, source, extra_hash=17)
+    assert disk.num_exact_indexed == 1
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="direct-exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    warm, matched_tokens = manager.lookup_exact_cache(token_ids + [999], extra_hash=17)
+
+    assert matched_tokens == len(token_ids)
+    assert warm is not None
+    _assert_allclose(warm[0][0], source[0][0])
+    _assert_allclose(warm[1].keys[..., :matched_tokens, :], source[1].keys)
+    manager.close()
 
 
 def test_image_hash_preserves_tensor_shape_and_dtype():

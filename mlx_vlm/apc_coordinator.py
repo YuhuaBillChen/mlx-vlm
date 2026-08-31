@@ -158,7 +158,11 @@ class APCCoordinator:
             return False
         from .apc import snapshot_prompt_cache_row
 
-        snapshot = snapshot_prompt_cache_row(prompt_cache, batch_idx or 0)
+        snapshot = snapshot_prompt_cache_row(
+            prompt_cache,
+            batch_idx or 0,
+            detach=not self.manager.direct_disk_writes,
+        )
         if snapshot is None:
             return False
         return self.manager.store_exact_cache(
