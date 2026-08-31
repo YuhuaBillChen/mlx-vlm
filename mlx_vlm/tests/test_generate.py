@@ -53,9 +53,7 @@ def test_turboquant_decode_reserve_is_layerwise_and_opt_in(monkeypatch):
         def reserve_for_append(self, tokens):
             events.append(("reserve", self.layer, tokens))
 
-    monkeypatch.setattr(
-        ar_module.mx, "clear_cache", lambda: events.append(("clear",))
-    )
+    monkeypatch.setattr(ar_module.mx, "clear_cache", lambda: events.append(("clear",)))
     caches = [CacheList(Reservable(0), object()), Reservable(1)]
 
     assert ar_module._reserve_turboquant_decode_capacity(caches, 512) == 0
@@ -69,6 +67,7 @@ def test_turboquant_decode_reserve_is_layerwise_and_opt_in(monkeypatch):
         ("reserve", 1, 512),
         ("clear",),
     ]
+
 
 # ============================================================================
 # Fixtures and Mock Classes

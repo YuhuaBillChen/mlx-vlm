@@ -16,8 +16,8 @@ from mlx_vlm.models.base import (
 from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
-    _TurboQuantAttentionMixin,
     _should_eval_cache_append,
+    _TurboQuantAttentionMixin,
 )
 
 H, D = 4, 64  # kv heads, head_dim
