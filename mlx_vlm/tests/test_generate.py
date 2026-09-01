@@ -69,6 +69,59 @@ def test_turboquant_decode_reserve_is_layerwise_and_opt_in(monkeypatch):
     ]
 
 
+def test_warm_prompt_reserve_is_layerwise_and_only_evals_growth(monkeypatch):
+    events = []
+
+    class Reservable:
+        def __init__(self, layer, grows):
+            self.layer = layer
+            self._idx = 100
+            self.grows = grows
+            self.state = mx.array([layer])
+
+        def prefix_cache_needs_reserve(self, needed):
+            events.append(("needs_reserve", self.layer, needed))
+            return self.grows
+
+        def prefix_cache_reserve(self, needed):
+            events.append(("reserve", self.layer, needed))
+            return (mx.array([self.layer]),) if self.grows else ()
+
+    monkeypatch.setattr(
+        ar_module.mx, "eval", lambda targets: events.append(("eval", len(targets)))
+    )
+    monkeypatch.setattr(ar_module.mx, "clear_cache", lambda: events.append(("clear",)))
+    caches = [CacheList(Reservable(0, True), object()), Reservable(1, False)]
+
+    assert ar_module._reserve_warm_prompt_capacity(caches, 256) == 1
+    assert events == [
+        ("needs_reserve", 0, 356),
+        ("eval", 2),
+        ("clear",),
+        ("reserve", 0, 356),
+        ("eval", 1),
+        ("clear",),
+        ("reserve", 1, 356),
+    ]
+
+
+def test_warm_prompt_full_suffix_reserve_is_opt_in(monkeypatch):
+    assert ar_module._warm_prompt_reserve_tokens(256, 8192) == 256
+
+    monkeypatch.setenv("MLX_VLM_TQ_RESERVE_WARM_FULL_SUFFIX", "1")
+
+    assert ar_module._warm_prompt_reserve_tokens(256, 8192) == 8192
+
+
+def test_warm_prefill_tail_step_only_applies_after_threshold(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_WARM_PREFILL_TAIL_THRESHOLD", "150000")
+    monkeypatch.setenv("MLX_VLM_WARM_PREFILL_TAIL_STEP", "128")
+
+    assert ar_module._warm_prefill_step_for_context(256, [131003], 18000) == 256
+    assert ar_module._warm_prefill_step_for_context(256, [131003], 19000) == 128
+    assert ar_module._warm_prefill_step_for_context(64, [131003], 19000) == 64
+
+
 # ============================================================================
 # Fixtures and Mock Classes
 # ============================================================================
@@ -792,6 +845,60 @@ class TestBatchGenerator:
         assert calls == [([[1, 2]], 0)]
         assert model.call_args.kwargs["inputs_embeds"].shape == (1, 2, 4)
         assert batch._input_ids.tolist() == [[3, 4, 5]]
+
+    def test_prompt_step_skips_unused_logits_when_model_supports_it(self, monkeypatch):
+        cache_state = mx.array([1])
+        model = MagicMock()
+        model.supports_skip_logits = True
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[1],
+            input_ids=[[1, 2, 3, 4, 5]],
+            max_tokens=[1],
+            inputs_embeds=mx.ones((1, 5, 4)),
+            prompt_kwargs={"position_ids": mx.arange(5)[None]},
+            prefill_step_size=2,
+            warm_cache=[SimpleNamespace(state=cache_state)],
+        )
+        monkeypatch.setattr(ar_module.mx, "async_eval", MagicMock())
+        monkeypatch.setattr(ar_module.mx, "clear_cache", MagicMock())
+
+        assert batch.prompt_step() == 2
+        assert model.call_args.kwargs["skip_logits"] is True
+        assert model.call_args.kwargs["position_ids"].shape == (1, 2)
+
+    def test_prompt_head_phase_swap_unloads_for_chunks_and_loads_for_final_token(
+        self, monkeypatch
+    ):
+        cache_state = mx.array([1])
+        model = MagicMock()
+        model.supports_skip_logits = True
+        model.prefill_head_phase_swap = SimpleNamespace(
+            unload=MagicMock(), load=MagicMock()
+        )
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[1],
+            input_ids=[[1, 2, 3]],
+            max_tokens=[1],
+            inputs_embeds=mx.ones((1, 3, 4)),
+            prompt_kwargs={},
+            prefill_step_size=2,
+            warm_cache=[SimpleNamespace(state=cache_state)],
+        )
+        monkeypatch.setattr(ar_module.mx, "async_eval", MagicMock())
+        monkeypatch.setattr(ar_module.mx, "clear_cache", MagicMock())
+
+        assert batch.prompt_step() == 2
+        model.prefill_head_phase_swap.unload.assert_called_once_with()
+
+        model.side_effect = RuntimeError("stop after lifecycle transition")
+        sampler = lambda logits: mx.array([1])
+        stop = MagicMock()
+        stop.eos_token_ids = []
+        with pytest.raises(RuntimeError, match="lifecycle transition"):
+            batch.generate(sampler, stop)
+        model.prefill_head_phase_swap.load.assert_called_once_with()
 
     def test_prompt_step_keeps_exact_apc_checkpoint_async(self, monkeypatch):
         cache_state = mx.array([1])
@@ -3426,6 +3533,64 @@ def test_single_row_apc_offsets_chunk_local_embedding_provider():
     suffix_provider = captured["prompt_kwargs"][ar_module.INPUT_EMBEDDING_PROVIDER_KEY]
     suffix_provider(mx.array([[4, 5]]), start=1)
     assert calls == [([[4, 5]], 5)]
+    assert ar_module.INPUT_EMBEDDING_PROVIDER_KEY not in sequence[3]
+
+
+def test_single_row_apc_uses_provider_suffix_view_when_available():
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = object()
+    bg.model = SimpleNamespace(layers=[object()])
+    bg.prefill_step_size = 2
+    bg.kv_bits = None
+    bg.kv_group_size = 64
+    bg.kv_quant_scheme = "affine"
+    bg._wire_stack = None
+    suffix_calls = []
+
+    def suffix_provider(input_ids, *, start):
+        suffix_calls.append((input_ids.tolist(), start))
+        return mx.ones((1, input_ids.shape[1], 4))
+
+    provider = MagicMock()
+    provider.slice_from.return_value = suffix_provider
+    sequence = (
+        1,
+        list(range(8)),
+        1,
+        {ar_module.INPUT_EMBEDDING_PROVIDER_KEY: provider},
+        [],
+        None,
+    )
+    pick = {
+        "matched_blocks": [],
+        "prefix_len": 4,
+        "extra_hash": 0,
+        "full_input_ids": list(range(8)),
+    }
+    captured = {}
+
+    def fake_prompt_batch(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    with (
+        patch.object(BatchGenerator, "_apc_pick_for", return_value=pick),
+        patch.object(
+            ar_module._apc,
+            "make_warm_batch_kv_cache_multi",
+            return_value=([], 4),
+        ),
+        patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch),
+    ):
+        batch = bg._build_mixed_prompt_batch([sequence])
+
+    assert batch is not None
+    provider.slice_from.assert_called_once_with(4)
+    actual = captured["prompt_kwargs"][ar_module.INPUT_EMBEDDING_PROVIDER_KEY]
+    assert actual is suffix_provider
+    actual(mx.array([[4, 5]]), start=1)
+    assert suffix_calls == [([[4, 5]], 1)]
+    assert ar_module.INPUT_EMBEDDING_PROVIDER_KEY not in sequence[3]
 
 
 def test_apc_pick_rejects_image_tokens_and_releases_blocks():

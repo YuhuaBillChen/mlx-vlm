@@ -1410,6 +1410,7 @@ class Qwen3_5Model(nn.Module):
 
 class LanguageModel(nn.Module):
     requires_uniform_batch_acceptance = True
+    supports_skip_logits = True
 
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()

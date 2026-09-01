@@ -3608,6 +3608,64 @@ def test_chat_completions_endpoint_flattens_text_content_parts(client):
     ]
 
 
+def test_chat_completions_preserves_image_message_origin(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen3_5")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+    image_url = "data:image/png;base64,ZmFrZS1pbWFnZQ=="
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                            {"type": "text", "text": "Inspect this image."},
+                        ],
+                    },
+                    {"role": "assistant", "content": "It contains a meter."},
+                    {"role": "user", "content": "Continue the analysis."},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.args[2] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url"},
+                {"type": "text", "text": "Inspect this image."},
+            ],
+        },
+        {"role": "assistant", "content": "It contains a meter."},
+        {"role": "user", "content": "Continue the analysis."},
+    ]
+    assert mock_template.call_args.kwargs["num_images"] == 1
+    assert mock_generate.call_args.kwargs["image"] == [image_url]
+
+
 def test_chat_completions_endpoint_forwards_native_video_content(client):
     model = SimpleNamespace()
     processor = SimpleNamespace(

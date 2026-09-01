@@ -802,12 +802,41 @@ def test_qwen_target_verify_4bit_linear_matches_singleton_path_exactly(
     assert bool(mx.array_equal(ref, out).item())
 
 
+@pytest.mark.parametrize("input_dims", [512, 6656])
+@pytest.mark.parametrize("verify_length", [3, 4])
+def test_qwen_target_verify_3bit_linear_matches_singleton_path_exactly(
+    input_dims, verify_length
+):
+    mx.random.seed(37 + input_dims + verify_length)
+    linear = nn.QuantizedLinear(input_dims, 16, bias=False, group_size=32, bits=3)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((1, verify_length, input_dims)).astype(mx.bfloat16)
+
+    ref = qwen_verifier._target_verify_timewise(linear, x)
+    out = qwen_verifier._target_verify_linear(linear, x)
+    public = qwen_verifier.Qwen3_5ExactSpeculativeVerifier().quantized_linear(linear, x)
+    mx.eval(ref, out, public)
+
+    assert bool(mx.array_equal(ref, out).item())
+    assert bool(mx.array_equal(ref, public).item())
+
+
+@pytest.mark.parametrize("bits", [3, 4])
 @pytest.mark.parametrize("output_dims", [(16, 24), (16, 24, 32), (8, 16, 24, 32)])
 @pytest.mark.parametrize("verify_length", [3, 6, 8])
-def test_qwen_target_verify_4bit_linears_fuse_exactly(output_dims, verify_length):
-    mx.random.seed(51 + len(output_dims) + verify_length)
+def test_qwen_target_verify_affine_linears_fuse_exactly(
+    bits, output_dims, verify_length
+):
+    mx.random.seed(51 + bits + len(output_dims) + verify_length)
     linears = tuple(
-        nn.QuantizedLinear(512, output_dim, bias=False, group_size=64, bits=4)
+        nn.QuantizedLinear(
+            512,
+            output_dim,
+            bias=False,
+            group_size=32 if bits == 3 else 64,
+            bits=bits,
+        )
         for output_dim in output_dims
     )
     for linear in linears:
@@ -820,6 +849,64 @@ def test_qwen_target_verify_4bit_linears_fuse_exactly(output_dims, verify_length
     mx.eval(*ref, *out)
 
     assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
+def test_qwen_exact_verifier_routes_short_turboquant_attention_as_one_tile():
+    calls = []
+    queries = mx.ones((1, 1, 4, 8), dtype=mx.float32)
+    gate = mx.zeros((1, 4, 8), dtype=mx.float32)
+    expected = mx.arange(32, dtype=mx.float32).reshape(1, 1, 4, 8)
+
+    class Verifier(qwen_verifier.Qwen3_5ExactSpeculativeVerifier):
+        @staticmethod
+        def _helpers():
+            return SimpleNamespace(
+                _qwen3_5_left_padded_attention=lambda *args, **kwargs: None
+            )
+
+        def _linears(self, linears, x):
+            return (x, x, x)
+
+        def _linear(self, linear, x):
+            return x
+
+    class Cache:
+        fused_attention_eligible = True
+
+        def prefill_attention(self, q, **kwargs):
+            calls.append((q, kwargs))
+            return expected
+
+    attention = SimpleNamespace(
+        q_proj=None,
+        k_proj=None,
+        v_proj=None,
+        o_proj=None,
+        scale=8**-0.5,
+        _prepare_projected_qkv=lambda *args: (
+            queries,
+            object(),
+            object(),
+            gate,
+            "causal",
+        ),
+    )
+
+    output = Verifier()._attention(
+        attention,
+        mx.zeros((1, 4, 8), dtype=mx.float32),
+        "causal",
+        Cache(),
+        None,
+        None,
+    )
+    mx.eval(output)
+
+    assert len(calls) == 1
+    assert calls[0][1]["mask"] == "causal"
+    expected_output = expected.transpose(0, 2, 1, 3).reshape(1, 4, 8)
+    expected_output *= mx.sigmoid(gate)
+    assert bool(mx.array_equal(output, expected_output))
 
 
 @pytest.mark.parametrize("input_dims", [512, 6144])
@@ -926,7 +1013,7 @@ def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
         assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
 
 
-@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("bits", [3, 4, 8])
 def test_qwen_target_verify_quantized_argmax_matches_singleton_path(bits):
     mx.random.seed(16 + bits)
     linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=bits)

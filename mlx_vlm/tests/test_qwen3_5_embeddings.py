@@ -41,3 +41,52 @@ def test_chunked_provider_matches_full_visual_embedding_merge():
         ]
     )
     assert mx.array_equal(chunked, expected).item()
+
+
+def test_chunked_provider_suffix_drops_consumed_visual_features():
+    image_token = 99
+    video_token = 100
+
+    def embed_tokens(input_ids):
+        return mx.repeat(input_ids[..., None].astype(mx.float32), 3, axis=-1)
+
+    image_features = mx.array([[10.0, 11.0, 12.0]])
+    provider = ChunkedInputEmbeddingProvider(
+        embed_tokens,
+        image_features,
+        (1,),
+        image_token,
+        video_token,
+    )
+
+    suffix = provider.slice_from(4)
+
+    assert suffix.image_features is None
+    assert suffix.visual_positions == ()
+    assert mx.array_equal(
+        suffix(mx.array([[5, 6]]), start=0),
+        embed_tokens(mx.array([[5, 6]])),
+    ).item()
+
+
+def test_text_suffix_embedding_spill_round_trips_bfloat16_bits(tmp_path):
+    def embed_tokens(input_ids):
+        values = mx.repeat(input_ids[..., None].astype(mx.float32), 5, axis=-1)
+        return (values / 7).astype(mx.bfloat16)
+
+    input_ids = mx.array([[1, 2, 3, 4, 5]])
+    provider = ChunkedInputEmbeddingProvider(embed_tokens, None, (), 99, 100)
+    spilled = provider.spill_to_disk(input_ids, str(tmp_path), chunk_size=2)
+
+    expected = embed_tokens(input_ids)
+    actual = mx.concatenate(
+        [
+            spilled(input_ids[:, :3], start=0),
+            spilled(input_ids[:, 3:], start=3),
+        ],
+        axis=1,
+    )
+    assert mx.array_equal(actual, expected).item()
+    path = spilled.path
+    spilled.cleanup()
+    assert not __import__("os").path.exists(path)

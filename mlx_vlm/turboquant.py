@@ -2442,6 +2442,174 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
         source=source,
     )
 
+@lru_cache(maxsize=None)
+def _fused_mse_prefill_qtile_kernel(
+    key_bits: int,
+    val_bits: int,
+    dim: int = 256,
+    query_tile: int = 4,
+):
+    """Packed MSE attention with one KV read shared by a short query tile."""
+    if not _metal_available() or key_bits <= 0 or val_bits <= 0:
+        return None
+    if dim < 32 or dim % 32 != 0 or query_tile <= 0:
+        return None
+
+    elems_per_lane = dim // 32
+    key_values = _gen_unrolled_extract(
+        key_bits,
+        elems_per_lane,
+        "key_codebook",
+        "key_bit_offset" if (elems_per_lane * key_bits) % 8 else "",
+    )
+    val_values = _gen_unrolled_extract(
+        val_bits,
+        elems_per_lane,
+        "val_codebook",
+        "value_bit_offset" if (elems_per_lane * val_bits) % 8 else "",
+    )
+
+    query_decls = []
+    accum_decls = []
+    query_updates = []
+    query_reductions = []
+    for q in range(query_tile):
+        query_decls.extend(
+            [
+                f"        int query_idx_{q} = query_base + {q};",
+                f"        thread U query_{q}[qk_per_thread];",
+                f"        if (query_idx_{q} < QueryLength) {{",
+                f"            auto query_ptr_{q} = queries + (bqh * QueryLength + query_idx_{q}) * Dim + simd_lid * qk_per_thread;",
+                f"            for (int i = 0; i < qk_per_thread; i++) query_{q}[i] = static_cast<U>(query_ptr_{q}[i]);",
+                "        }",
+            ]
+        )
+        accum_decls.extend(
+            [
+                f"        thread U output_{q}[v_per_thread] = {{}};",
+                f"        U max_score_{q} = -INFINITY;",
+                f"        U sum_exp_score_{q} = 0;",
+            ]
+        )
+        score = "\n                    + ".join(
+            f"query_{q}[{i}] * key_value_{i}" for i in range(elems_per_lane)
+        )
+        value_updates = "\n".join(
+            f"                output_{q}[{i}] = output_{q}[{i}] * factor_{q} + exp_score_{q} * value_{i} * value_norm;"
+            for i in range(elems_per_lane)
+        )
+        query_updates.extend(
+            [
+                f"            if (query_idx_{q} < QueryLength && token_idx <= (int)token_count - QueryLength + query_idx_{q}) {{",
+                f"                U score_{q} = {score};",
+                f"                score_{q} = simd_sum(score_{q}) * key_norm;",
+                f"                U new_max_{q} = max(max_score_{q}, score_{q});",
+                f"                U factor_{q} = fast::exp(max_score_{q} - new_max_{q});",
+                f"                U exp_score_{q} = fast::exp(score_{q} - new_max_{q});",
+                f"                max_score_{q} = new_max_{q};",
+                f"                sum_exp_score_{q} = sum_exp_score_{q} * factor_{q} + exp_score_{q};",
+                value_updates,
+                "            }",
+            ]
+        )
+        query_reductions.extend(
+            [
+                f"        if (query_idx_{q} < QueryLength) {{",
+                "            if (simd_lid == 0) {",
+                f"                max_scores[simd_gid] = max_score_{q};",
+                f"                sum_exp_scores[simd_gid] = sum_exp_score_{q};",
+                "            }",
+                "            threadgroup_barrier(mem_flags::mem_threadgroup);",
+                "            U simdgroup_max = max_scores[simd_lid];",
+                "            U global_max = simd_max(simdgroup_max);",
+                "            U simdgroup_factor = fast::exp(simdgroup_max - global_max);",
+                "            U total_sum = simd_sum(sum_exp_scores[simd_lid] * simdgroup_factor);",
+                f"            U output_factor = fast::exp(max_score_{q} - global_max);",
+                "            for (int i = 0; i < v_per_thread; i++) {",
+                f"                shared[simd_lid * BD + simd_gid] = output_{q}[i] * output_factor;",
+                "                threadgroup_barrier(mem_flags::mem_threadgroup);",
+                f"                output_{q}[i] = simd_sum(shared[simd_gid * BD + simd_lid]);",
+                f"                output_{q}[i] = total_sum > 0 ? output_{q}[i] / total_sum : 0;",
+                "                threadgroup_barrier(mem_flags::mem_threadgroup);",
+                "            }",
+                "            if (simd_lid == 0) {",
+                "                for (int i = 0; i < v_per_thread; i++)",
+                f"                    out[(bqh * QueryLength + query_idx_{q}) * Dim + simd_gid * v_per_thread + i] = static_cast<U>(output_{q}[i]);",
+                "            }",
+                "        }",
+            ]
+        )
+
+    key_decls = "\n".join(
+        f"            U key_value_{i} = {expr};" for i, expr in enumerate(key_values)
+    )
+    val_decls = "\n".join(
+        f"            U value_{i} = {expr.replace('kb[', 'vb[')};"
+        for i, expr in enumerate(val_values)
+    )
+    source = f"""
+        constexpr int BN = 32;
+        constexpr int BD = 32;
+        constexpr int qk_per_thread = Dim / BD;
+        constexpr int v_per_thread = Dim / BD;
+        typedef float U;
+
+        auto logical_tile = threadgroup_position_in_grid.x;
+        constexpr int TilesPerHead = (QueryLength + QueryTile - 1) / QueryTile;
+        auto bqh = logical_tile / TilesPerHead;
+        auto tile_idx = logical_tile % TilesPerHead;
+        auto query_base = tile_idx * QueryTile;
+        auto simd_gid = simdgroup_index_in_threadgroup;
+        auto simd_lid = thread_index_in_simdgroup;
+
+        auto token_count = key_norms_shape[2];
+        auto kv_heads = key_norms_shape[1];
+        auto bh = bqh / RepeatCount;
+        auto key_norms_ptr = key_norms + bh * token_count;
+        auto keys_ptr = key_packed + bh * token_count * KPackedWidth;
+        auto value_norms_ptr = val_norms + bh * token_count;
+        auto values_ptr = val_packed + bh * token_count * VPackedWidth;
+
+{chr(10).join(query_decls)}
+{chr(10).join(accum_decls)}
+
+        int key_bit_start = simd_lid * qk_per_thread * KeyBits;
+        int value_bit_start = simd_lid * v_per_thread * ValBits;
+        int key_byte_base = key_bit_start >> 3;
+        int value_byte_base = value_bit_start >> 3;
+        int key_bit_offset = key_bit_start & 7;
+        int value_bit_offset = value_bit_start & 7;
+
+        for (int token_idx = simd_gid; token_idx < (int)token_count; token_idx += BN) {{
+            U key_norm = static_cast<U>(key_norms_ptr[token_idx]);
+            U value_norm = static_cast<U>(value_norms_ptr[token_idx]);
+            auto kb = (const device uint8_t*)(keys_ptr + token_idx * KPackedWidth) + key_byte_base;
+            auto vb = (const device uint8_t*)(values_ptr + token_idx * VPackedWidth) + value_byte_base;
+{key_decls}
+{val_decls}
+{chr(10).join(query_updates)}
+        }}
+
+        threadgroup U max_scores[BN];
+        threadgroup U sum_exp_scores[BN];
+        threadgroup U shared[BN * BD];
+{chr(10).join(query_reductions)}
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"turboquant_mse_prefill_q{query_tile}_k{key_bits}_v{val_bits}_d{dim}",
+        input_names=[
+            "queries",
+            "key_norms",
+            "key_packed",
+            "key_codebook",
+            "val_norms",
+            "val_packed",
+            "val_codebook",
+        ],
+        output_names=["out"],
+        source=source,
+    )
 
 @lru_cache(maxsize=None)
 def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 256):
@@ -5423,6 +5591,73 @@ class _TurboQuantAttentionMixin:
         keys_state = self._unwrap(keys_state)
         values_state = self._unwrap(values_state)
 
+        # MTP target verification is a decode-shaped causal call with only a
+        # handful of query rows.  Keep those rows in registers so each packed
+        # MSE K/V token is unpacked once instead of once per verify row, and do
+        # not materialize the L x T score tensor used by the generic path.
+        if (
+            os.environ.get("MLX_VLM_TQ_MTP_QTILE") == "1"
+            and isinstance(mask, str)
+            and mask == "causal"
+            and 1 < queries.shape[-2] <= 4
+            and isinstance(self.key_codec, _TurboQuantMSECodec)
+            and isinstance(self.value_codec, _TurboQuantMSECodec)
+            and isinstance(keys_state, TurboQuantMSEState)
+            and isinstance(values_state, TurboQuantMSEState)
+        ):
+            B, n_q_heads, L, D = queries.shape
+            n_kv_heads = keys_state.norms.shape[1]
+            n_repeats = n_q_heads // n_kv_heads
+            T = keys_state.norms.shape[2]
+            key_bits = int(self.key_codec.bits)
+            val_bits = int(self.value_codec.bits)
+            if (
+                T >= L
+                and key_bits == self.key_codec.bits
+                and val_bits == self.value_codec.bits
+            ):
+                kernel = _fused_mse_prefill_qtile_kernel(
+                    key_bits,
+                    val_bits,
+                    D,
+                    query_tile=4,
+                )
+                if kernel is not None:
+                    grouped = (queries * scale).reshape(
+                        B, n_kv_heads, n_repeats, L, D
+                    )
+                    q_rot = self.key_codec.prepare_queries(grouped)
+                    logical_queries = B * n_q_heads * L
+                    logical_tiles = B * n_q_heads
+                    out = kernel(
+                        inputs=[
+                            q_rot.reshape(logical_queries, D),
+                            keys_state.norms,
+                            keys_state.indices,
+                            self.key_codec.codebook,
+                            values_state.norms,
+                            values_state.indices,
+                            self.value_codec.codebook,
+                        ],
+                        template=[
+                            ("Dim", D),
+                            ("RepeatCount", n_repeats),
+                            ("QueryLength", L),
+                            ("QueryTile", 4),
+                            ("KeyBits", key_bits),
+                            ("ValBits", val_bits),
+                            ("KPackedWidth", keys_state.indices.shape[-1]),
+                            ("VPackedWidth", values_state.indices.shape[-1]),
+                        ],
+                        grid=(logical_tiles * 1024, 1, 1),
+                        threadgroup=(1024, 1, 1),
+                        output_shapes=[(logical_queries, D)],
+                        output_dtypes=[mx.float32],
+                    )[0]
+                    rotated = out.reshape(B, n_kv_heads, n_repeats, L, D)
+                    output = self.value_codec._rotate_inverse(rotated)
+                    return output.reshape(B, n_q_heads, L, D).astype(queries.dtype)
+
         if not (
             isinstance(self.key_codec, _TurboQuantProdCodec)
             and isinstance(self.value_codec, _TurboQuantMSECodec)
@@ -6463,6 +6698,7 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
     """
 
     cache_step = 256
+    prefix_cache_step = 4096
 
     def __init__(
         self,
@@ -6567,6 +6803,34 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         )
         mx.eval(self.keys, self.values)
         return _state_length(self.keys)
+
+    def prefix_cache_reserve(self, min_capacity_tokens: int):
+        """Reserve restored packed storage without changing logical offsets."""
+        if self.keys is None or self.values is None:
+            return ()
+        needed = max(self._idx, int(min_capacity_tokens))
+        if min(_state_length(self.keys), _state_length(self.values)) >= needed:
+            return ()
+        if _state_length(self.keys) < needed:
+            self.keys = _reserve_state_capacity(
+                self.keys, self._idx, needed, self.prefix_cache_step
+            )
+            mx.eval(self.keys)
+            mx.clear_cache()
+        if _state_length(self.values) < needed:
+            self.values = _reserve_state_capacity(
+                self.values, self._idx, needed, self.prefix_cache_step
+            )
+            mx.eval(self.values)
+            mx.clear_cache()
+        return self.keys, self.values
+
+    def prefix_cache_needs_reserve(self, min_capacity_tokens: int) -> bool:
+        """Return whether a restored packed cache must grow for this step."""
+        if self.keys is None or self.values is None:
+            return False
+        needed = max(self._idx, int(min_capacity_tokens))
+        return min(_state_length(self.keys), _state_length(self.values)) < needed
 
     def zero_row_tail(self, bi: int, start: int, end: int):
         if start >= end:

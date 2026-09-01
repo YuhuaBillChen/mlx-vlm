@@ -1,8 +1,13 @@
 from bisect import bisect_left
+import logging
+import os
+import tempfile
+import time
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from ..base import InputEmbeddingsFeatures
 from ..qwen3_vl import Model as Qwen3VLModel
@@ -12,6 +17,41 @@ from .config import ModelConfig
 from .fp8 import convert_qwen_fp8_weights
 from .language import LanguageModel
 from .vision import VisionModel
+
+logger = logging.getLogger("mlx_vlm.generate")
+
+
+class DiskBackedInputEmbeddingProvider:
+    """Serve exact BF16 prompt embeddings from a request-local raw file."""
+
+    def __init__(self, path: str, shape: tuple[int, ...]):
+        self.path = path
+        self.shape = shape
+        self.row_bytes = shape[-1] * 2
+
+    def __call__(self, input_ids: mx.array, *, start: int) -> mx.array:
+        length = input_ids.shape[1]
+        count = length * self.shape[-1]
+        raw = np.fromfile(
+            self.path,
+            dtype=np.uint16,
+            count=count,
+            offset=start * self.row_bytes,
+        )
+        if raw.size != count:
+            raise EOFError("disk-backed prompt embedding ended early")
+        return mx.array(raw.reshape(1, length, self.shape[-1])).view(mx.bfloat16)
+
+    def cleanup(self) -> None:
+        path, self.path = self.path, ""
+        if path:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    def __del__(self):
+        self.cleanup()
 
 
 class ChunkedInputEmbeddingProvider:
@@ -31,6 +71,25 @@ class ChunkedInputEmbeddingProvider:
         self.image_token_index = image_token_index
         self.video_token_index = video_token_index
 
+    def slice_from(self, start: int) -> "ChunkedInputEmbeddingProvider":
+        """Return a suffix-relative provider without consumed vision features."""
+        first = bisect_left(self.visual_positions, start)
+        visual_positions = tuple(
+            position - start for position in self.visual_positions[first:]
+        )
+        image_features = self.image_features
+        if not visual_positions:
+            image_features = None
+        elif first:
+            image_features = image_features[first:]
+        return type(self)(
+            self.embed_tokens,
+            image_features,
+            visual_positions,
+            self.image_token_index,
+            self.video_token_index,
+        )
+
     def __call__(self, input_ids: mx.array, *, start: int) -> mx.array:
         inputs_embeds = self.embed_tokens(input_ids)
         stop = start + input_ids.shape[1]
@@ -46,6 +105,44 @@ class ChunkedInputEmbeddingProvider:
             self.video_token_index,
         )
         return inputs_embeds
+
+    def spill_to_disk(
+        self, input_ids: mx.array, directory: str, *, chunk_size: int = 4096
+    ) -> DiskBackedInputEmbeddingProvider:
+        if input_ids.shape[0] != 1 or self.visual_positions:
+            raise ValueError("embedding spill requires one text-only suffix row")
+        started = time.perf_counter()
+        handle = tempfile.NamedTemporaryFile(
+            prefix="mlx-vlm-embeddings-", suffix=".bf16", dir=directory, delete=False
+        )
+        path = handle.name
+        hidden_size = None
+        try:
+            with handle:
+                for start in range(0, input_ids.shape[1], chunk_size):
+                    chunk = self(input_ids[:, start : start + chunk_size], start=start)
+                    mx.eval(chunk)
+                    hidden_size = chunk.shape[-1]
+                    np.asarray(chunk.view(mx.uint16)).tofile(handle)
+                    del chunk
+                    mx.clear_cache()
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            raise
+        logger.info(
+            "Warm-suffix embeddings spilled to disk: tokens=%d bytes=%d elapsed=%.3fs",
+            input_ids.shape[1],
+            os.path.getsize(path),
+            time.perf_counter() - started,
+        )
+        return DiskBackedInputEmbeddingProvider(
+            path, (1, input_ids.shape[1], int(hidden_size))
+        )
 
 
 def sanitize_key(key):

@@ -1193,6 +1193,30 @@ class ResponseGenerator:
             if get_max_num_seqs() != 1:
                 raise ValueError("Vision phase swap requires --max-num-seqs 1.")
             self.vision_phase_swap = VisionTowerPhaseSwap(model, vision_component)
+        language_head_component = os.environ.get(
+            "MLX_VLM_LANGUAGE_HEAD_PHASE_SWAP_PATH"
+        )
+        if language_head_component:
+            if get_max_num_seqs() != 1:
+                raise ValueError("Language-head phase swap requires --max-num-seqs 1.")
+            from .language_lifecycle import LanguageHeadPhaseSwap
+
+            language_model = getattr(model, "language_model", model)
+            language_model.prefill_head_phase_swap = LanguageHeadPhaseSwap(
+                language_model, language_head_component
+            )
+        embedding_component = os.environ.get(
+            "MLX_VLM_INPUT_EMBEDDING_PHASE_SWAP_PATH"
+        )
+        if embedding_component:
+            if get_max_num_seqs() != 1:
+                raise ValueError("Embedding phase swap requires --max-num-seqs 1.")
+            from .language_lifecycle import LanguageEmbeddingPhaseSwap
+
+            language_model = getattr(model, "language_model", model)
+            language_model.prefill_embedding_phase_swap = LanguageEmbeddingPhaseSwap(
+                language_model, embedding_component
+            )
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )

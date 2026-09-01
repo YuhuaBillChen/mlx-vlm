@@ -1642,6 +1642,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             if isinstance(message.content, str):
                 msg["content"] = message.content
             elif isinstance(message.content, list):
+                image_markers = []
                 if message.role == "user":
                     for item in message.content:
                         if not isinstance(item, dict):
@@ -1649,15 +1650,29 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         item_type = item.get("type")
                         if item_type == "input_image":
                             images.append(item["image_url"])
+                            image_markers.append({"type": item_type})
                         elif item_type == "image_url":
                             images.append(item["image_url"]["url"])
+                            image_markers.append({"type": item_type})
                         elif item_type == "input_audio":
                             audio.append(_decode_input_audio_data(item["input_audio"]))
                         elif item_type in ("input_video", "video_url", "video"):
                             video = _extract_video_reference(item)
                             if video:
                                 videos.append(video)
-                msg["content"] = extract_text_from_content(message.content)
+                text_content = extract_text_from_content(message.content)
+                if image_markers:
+                    # Keep lightweight markers on their originating message so
+                    # apply_chat_template can allocate the global image side
+                    # channel without moving earlier-turn images to the last
+                    # user message. URLs/data remain out of the rendered prompt.
+                    msg["content"] = list(image_markers)
+                    if text_content:
+                        msg["content"].append(
+                            {"type": "text", "text": text_content}
+                        )
+                else:
+                    msg["content"] = text_content
             else:
                 msg["content"] = message.content
 

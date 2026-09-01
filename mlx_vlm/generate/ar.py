@@ -98,6 +98,68 @@ def _reserve_turboquant_decode_capacity(prompt_cache, max_tokens: int) -> int:
     return reserved
 
 
+def _reserve_warm_prompt_capacity(prompt_cache, tokens: int) -> int:
+    """Grow restored packed caches layerwise before the next prefill forward."""
+    tokens = max(0, int(tokens))
+    if tokens == 0:
+        return 0
+    entries = []
+    pending = list(prompt_cache)
+    while pending:
+        cache_entry = pending.pop(0)
+        if isinstance(cache_entry, cache.CacheList):
+            pending[0:0] = cache_entry.caches
+            continue
+        entries.append(cache_entry)
+
+    # A preceding chunk may still have an async graph holding every layer's
+    # old packed storage.  Only at an actual capacity boundary, finish that
+    # graph before allocating replacements so old and new full-cache
+    # generations cannot overlap.
+    if any(
+        callable(needs_reserve := getattr(entry, "prefix_cache_needs_reserve", None))
+        and needs_reserve(int(getattr(entry, "_idx", 0) or 0) + tokens)
+        for entry in entries
+    ):
+        states = [entry.state for entry in entries if hasattr(entry, "state")]
+        if states:
+            mx.eval(states)
+            mx.clear_cache()
+
+    grown = 0
+    for cache_entry in entries:
+        reserve = getattr(cache_entry, "prefix_cache_reserve", None)
+        if not callable(reserve):
+            continue
+        current = int(getattr(cache_entry, "_idx", 0) or 0)
+        targets = reserve(current + tokens)
+        if not targets:
+            continue
+        mx.eval(targets)
+        mx.clear_cache()
+        grown += 1
+    return grown
+
+
+def _warm_prompt_reserve_tokens(chunk_tokens: int, remaining_tokens: int) -> int:
+    """Choose rolling or exact-suffix packed-cache reservation."""
+    if os.environ.get("MLX_VLM_TQ_RESERVE_WARM_FULL_SUFFIX") == "1":
+        return max(0, int(remaining_tokens))
+    return max(0, int(chunk_tokens))
+
+
+def _warm_prefill_step_for_context(
+    step: int, cached_tokens: List[int], processed_columns: int
+) -> int:
+    """Optionally cap only the extreme-context tail of warm prefill."""
+    threshold = int(os.environ.get("MLX_VLM_WARM_PREFILL_TAIL_THRESHOLD", "0"))
+    tail_step = int(os.environ.get("MLX_VLM_WARM_PREFILL_TAIL_STEP", "0"))
+    if threshold <= 0 or tail_step <= 0 or not cached_tokens:
+        return step
+    context = max(int(value) for value in cached_tokens) + int(processed_columns)
+    return min(step, tail_step) if context >= threshold else step
+
+
 def _get_batch_cache_eval_interval() -> int:
     raw = os.environ.get("MLX_VLM_BATCH_CACHE_EVAL_INTERVAL")
     if raw is None:
@@ -1785,6 +1847,7 @@ class PromptProcessingBatch:
         self._input_embedding_provider = self._prompt_kwargs.pop(
             INPUT_EMBEDDING_PROVIDER_KEY, None
         )
+        self._embedding_phase_swap_pending = False
         self._prompt_length_aware_keys: List[str] = []
         if self._prompt_kwargs:
             prompt_batch = self._input_ids.shape[0]
@@ -1816,6 +1879,33 @@ class PromptProcessingBatch:
                 len(full_input_ids) if full_input_ids is not None else suffix_len
             )
             self._cached_tokens_per_row.append(prefix_len)
+
+        spill_directory = os.environ.get("MLX_VLM_INPUT_EMBEDDING_SPILL_DIR")
+        embedding_phase_swap = getattr(
+            self.model, "prefill_embedding_phase_swap", None
+        )
+        if (
+            spill_directory
+            and embedding_phase_swap is not None
+            and any(self._cached_tokens_per_row)
+            and self._inputs_embeds is None
+            and self._input_embedding_provider is not None
+        ):
+            spill = getattr(self._input_embedding_provider, "spill_to_disk", None)
+            if not callable(spill):
+                raise ValueError(
+                    "Embedding phase swap requires a spill-capable input provider"
+                )
+            head_phase_swap = getattr(self.model, "prefill_head_phase_swap", None)
+            if head_phase_swap is not None:
+                head_phase_swap.unload()
+            provider = spill(self._input_ids, spill_directory)
+            self._input_embedding_provider = provider
+            # The caller that assembled this batch can still hold the original
+            # provider until this constructor returns.  Defer the actual table
+            # release to the first prompt step, after those temporary owner
+            # references are gone and before any model forward is submitted.
+            self._embedding_phase_swap_pending = True
 
         if warm_cache is not None:
             self.prompt_cache = warm_cache
@@ -2021,14 +2111,36 @@ class PromptProcessingBatch:
         if not self.needs_processing():
             return 0
 
+        if self._embedding_phase_swap_pending:
+            embedding_phase_swap = getattr(
+                self.model, "prefill_embedding_phase_swap", None
+            )
+            if embedding_phase_swap is not None:
+                embedding_phase_swap.unload()
+            self._embedding_phase_swap_pending = False
+
         step = self.prefill_step_size or self._input_ids.shape[1]
+        step = _warm_prefill_step_for_context(
+            step, self._cached_tokens_per_row, self._processed_prompt_columns
+        )
         n = min(step, self._input_ids.shape[1] - 1)
         checkpoint_col = self._next_apc_checkpoint_column()
         if checkpoint_col is not None:
             n = min(n, checkpoint_col - self._processed_prompt_columns)
         if n <= 0:
             return 0
+        phase_swap = getattr(self.model, "prefill_head_phase_swap", None)
+        if phase_swap is not None:
+            phase_swap.unload()
+        if any(self._cached_tokens_per_row):
+            _reserve_warm_prompt_capacity(
+                self.prompt_cache,
+                _warm_prompt_reserve_tokens(n, self._input_ids.shape[1]),
+            )
         prompt_kwargs = self._prompt_kwargs_for_step(n)
+        if getattr(self.model, "supports_skip_logits", False):
+            prompt_kwargs = dict(prompt_kwargs)
+            prompt_kwargs["skip_logits"] = True
         if self._inputs_embeds is not None:
             inputs_embeds = self._inputs_embeds[:, :n]
         elif self._input_embedding_provider is not None:
@@ -2097,6 +2209,9 @@ class PromptProcessingBatch:
         self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
     ) -> GenerationBatch:
         """Process final tokens and transition to GenerationBatch."""
+        phase_swap = getattr(self.model, "prefill_head_phase_swap", None)
+        if phase_swap is not None:
+            phase_swap.load()
         call_kwargs = dict(self._prompt_kwargs)
         if self.draft_model is not None and self.draft_kind is not None:
             call_kwargs.update(
@@ -2310,6 +2425,16 @@ class PromptProcessingBatch:
         _reserve_turboquant_decode_capacity(
             self.prompt_cache, max(self.max_tokens, default=0)
         )
+
+        embedding_phase_swap = getattr(
+            self.model, "prefill_embedding_phase_swap", None
+        )
+        if embedding_phase_swap is not None:
+            embedding_phase_swap.load()
+        cleanup_provider = getattr(self._input_embedding_provider, "cleanup", None)
+        if callable(cleanup_provider):
+            cleanup_provider()
+        self._input_embedding_provider = None
 
         self.uids = []
         self.prompt_cache = []
@@ -2620,9 +2745,13 @@ class BatchGenerator:
                 )
             provider = providers[0]
             prefix_len = prefix_lens[0]
+            slice_from = getattr(provider, "slice_from", None)
+            if callable(slice_from):
+                suffix_provider = slice_from(prefix_len)
+            else:
 
-            def suffix_provider(input_ids, *, start=0):
-                return provider(input_ids, start=prefix_len + start)
+                def suffix_provider(input_ids, *, start=0):
+                    return provider(input_ids, start=prefix_len + start)
 
             inputs_embeds = None
         else:
@@ -2753,7 +2882,7 @@ class BatchGenerator:
         prompt_batch_cls = _generate_module_override(
             "PromptProcessingBatch", PromptProcessingBatch
         )
-        return prompt_batch_cls(
+        prompt_batch = prompt_batch_cls(
             model=self.model,
             uids=uids,
             input_ids=suffix_ids_list,
@@ -2785,6 +2914,15 @@ class BatchGenerator:
             draft_block_size=getattr(self, "draft_block_size", None),
             greedy_sampling=getattr(self, "greedy_sampling", False),
         )
+        if suffix_provider is not None:
+            # PromptProcessingBatch now owns either the suffix view or its
+            # disk-backed replacement.  Drop the queued request's full-prompt
+            # provider so it cannot keep the embedding table alive during
+            # warm prefill.
+            for prompt_kwargs in prompt_kwargs_list:
+                if prompt_kwargs is not None:
+                    prompt_kwargs.pop(INPUT_EMBEDDING_PROVIDER_KEY, None)
+        return prompt_batch
 
     def _build_apc_meta_for_cold(
         self,
