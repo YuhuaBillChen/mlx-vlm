@@ -28,7 +28,10 @@ def _use_target_verify_dense(linear, x: mx.array) -> bool:
 
 
 def _target_verify_qlinear_header(
-    bits: int, group_size: int, results_per_simdgroup: int = 4
+    bits: int,
+    group_size: int,
+    results_per_simdgroup: int = 4,
+    q3_shifted: bool = False,
 ) -> str:
     return (
         r"""
@@ -37,6 +40,7 @@ def _target_verify_qlinear_header(
     constant constexpr int SIMD_SIZE = 32;
     constant constexpr int BITS = __BITS__;
     constant constexpr int GS = __GS__;
+    constant constexpr bool Q3_SHIFTED = __Q3_SHIFTED__;
     constant constexpr int PACK_FACTOR =
         ((BITS == 3 || BITS == 5) ? 8 : 32 / BITS);
     constant constexpr int BYTES_PER_PACK =
@@ -57,13 +61,13 @@ def _target_verify_qlinear_header(
           sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] +
               x[i + 5] + x[i + 6] + x[i + 7];
           x_thread[i] = x[i];
-          x_thread[i + 1] = x[i + 1] / 8.0f;
-          x_thread[i + 2] = x[i + 2] / 64.0f;
-          x_thread[i + 3] = x[i + 3] / 2.0f;
-          x_thread[i + 4] = x[i + 4] / 16.0f;
-          x_thread[i + 5] = x[i + 5] / 128.0f;
-          x_thread[i + 6] = x[i + 6] / 4.0f;
-          x_thread[i + 7] = x[i + 7] / 32.0f;
+          x_thread[i + 1] = Q3_SHIFTED ? x[i + 1] : x[i + 1] / 8.0f;
+          x_thread[i + 2] = Q3_SHIFTED ? x[i + 2] : x[i + 2] / 64.0f;
+          x_thread[i + 3] = Q3_SHIFTED ? x[i + 3] : x[i + 3] / 2.0f;
+          x_thread[i + 4] = Q3_SHIFTED ? x[i + 4] : x[i + 4] / 16.0f;
+          x_thread[i + 5] = Q3_SHIFTED ? x[i + 5] : x[i + 5] / 128.0f;
+          x_thread[i + 6] = Q3_SHIFTED ? x[i + 6] : x[i + 6] / 4.0f;
+          x_thread[i + 7] = Q3_SHIFTED ? x[i + 7] : x[i + 7] / 32.0f;
         }
       } else if (BITS == 4) {
         for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
@@ -107,15 +111,15 @@ def _target_verify_qlinear_header(
           const thread float* xt = x_thread + 8 * i;
           const device uint8_t* wb = w + 3 * i;
           accum += (wb[0] & 0x07) * xt[0];
-          accum += (wb[0] & 0x38) * xt[1];
-          accum += (wb[0] & 0xc0) * xt[2];
-          accum += (wb[1] & 0x01) * (xt[2] * 256.0f);
-          accum += (wb[1] & 0x0e) * xt[3];
-          accum += (wb[1] & 0x70) * xt[4];
-          accum += (wb[1] & 0x80) * xt[5];
-          accum += (wb[2] & 0x03) * (xt[5] * 256.0f);
-          accum += (wb[2] & 0x1c) * xt[6];
-          accum += (wb[2] & 0xe0) * xt[7];
+          accum += (Q3_SHIFTED ? ((wb[0] >> 3) & 0x07) : (wb[0] & 0x38)) * xt[1];
+          accum += (Q3_SHIFTED ? (wb[0] >> 6) : (wb[0] & 0xc0)) * xt[2];
+          accum += (wb[1] & 0x01) * (xt[2] * (Q3_SHIFTED ? 4.0f : 256.0f));
+          accum += (Q3_SHIFTED ? ((wb[1] >> 1) & 0x07) : (wb[1] & 0x0e)) * xt[3];
+          accum += (Q3_SHIFTED ? ((wb[1] >> 4) & 0x07) : (wb[1] & 0x70)) * xt[4];
+          accum += (Q3_SHIFTED ? (wb[1] >> 7) : (wb[1] & 0x80)) * xt[5];
+          accum += (wb[2] & 0x03) * (xt[5] * (Q3_SHIFTED ? 2.0f : 256.0f));
+          accum += (Q3_SHIFTED ? ((wb[2] >> 2) & 0x07) : (wb[2] & 0x1c)) * xt[6];
+          accum += (Q3_SHIFTED ? (wb[2] >> 5) : (wb[2] & 0xe0)) * xt[7];
         }
       } else if (BITS == 4) {
         const device uint16_t* ws = (const device uint16_t*)w;
@@ -166,15 +170,15 @@ def _target_verify_qlinear_header(
           const thread float* xt = x_thread + 8 * i;
           const thread uint8_t* packed = wb + 3 * i;
           accum += (packed[0] & 0x07) * xt[0];
-          accum += (packed[0] & 0x38) * xt[1];
-          accum += (packed[0] & 0xc0) * xt[2];
-          accum += (packed[1] & 0x01) * (xt[2] * 256.0f);
-          accum += (packed[1] & 0x0e) * xt[3];
-          accum += (packed[1] & 0x70) * xt[4];
-          accum += (packed[1] & 0x80) * xt[5];
-          accum += (packed[2] & 0x03) * (xt[5] * 256.0f);
-          accum += (packed[2] & 0x1c) * xt[6];
-          accum += (packed[2] & 0xe0) * xt[7];
+          accum += (Q3_SHIFTED ? ((packed[0] >> 3) & 0x07) : (packed[0] & 0x38)) * xt[1];
+          accum += (Q3_SHIFTED ? (packed[0] >> 6) : (packed[0] & 0xc0)) * xt[2];
+          accum += (packed[1] & 0x01) * (xt[2] * (Q3_SHIFTED ? 4.0f : 256.0f));
+          accum += (Q3_SHIFTED ? ((packed[1] >> 1) & 0x07) : (packed[1] & 0x0e)) * xt[3];
+          accum += (Q3_SHIFTED ? ((packed[1] >> 4) & 0x07) : (packed[1] & 0x70)) * xt[4];
+          accum += (Q3_SHIFTED ? (packed[1] >> 7) : (packed[1] & 0x80)) * xt[5];
+          accum += (packed[2] & 0x03) * (xt[5] * (Q3_SHIFTED ? 2.0f : 256.0f));
+          accum += (Q3_SHIFTED ? ((packed[2] >> 2) & 0x07) : (packed[2] & 0x1c)) * xt[6];
+          accum += (Q3_SHIFTED ? (packed[2] >> 5) : (packed[2] & 0xe0)) * xt[7];
         }
       } else if (BITS == 4) {
         for (int i = 0; i < (VALUES_PER_THREAD / 4); i++) {
@@ -192,6 +196,7 @@ def _target_verify_qlinear_header(
 """.replace("__BITS__", str(bits))
         .replace("__GS__", str(group_size))
         .replace("__RESULTS_PER_SIMDGROUP__", str(results_per_simdgroup))
+        .replace("__Q3_SHIFTED__", "true" if q3_shifted else "false")
     )
 
 
@@ -1056,7 +1061,7 @@ def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_s
         ),
         input_names=["x", "w", "scales", "biases"],
         output_names=["tile_values", "tile_indices"],
-        header=_target_verify_qlinear_header(bits, group_size),
+        header=_target_verify_qlinear_header(bits, group_size, q3_shifted=bits == 3),
         source=_TARGET_VERIFY_QARGMAX_SOURCE,
     )
 
@@ -1073,7 +1078,7 @@ def _target_verify_masked_qargmax_kernel(
         ),
         input_names=["x", "w", "scales", "biases", "mask"],
         output_names=["tile_values", "tile_indices"],
-        header=_target_verify_qlinear_header(bits, group_size),
+        header=_target_verify_qlinear_header(bits, group_size, q3_shifted=bits == 3),
         source=_TARGET_VERIFY_MASKED_QARGMAX_SOURCE,
     )
 
@@ -1709,9 +1714,9 @@ class Qwen3_5ExactSpeculativeVerifier:
         return _target_verify_quantized_argmax(linear, x, token_mask=token_mask)
 
     def can_quantized_head(self, linear) -> bool:
-        return _can_target_verify_mxfp4_head(
-            linear
-        ) or _can_target_verify_quantized_head(linear)
+        return _can_target_verify_mxfp4_head(linear) or (
+            _can_target_verify_quantized_head(linear) and linear.bits != 3
+        )
 
     def pad_token_mask(self, token_mask: mx.array, n_size: int) -> mx.array:
         return _pad_token_mask_to_head(token_mask, n_size)
