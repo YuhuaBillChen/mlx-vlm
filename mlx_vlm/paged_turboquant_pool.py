@@ -291,6 +291,23 @@ class PagedTurboQuantPoolRegistry:
             for target in created:
                 target.release()
             raise
+        # The paged Q4 leaves already preserve ragged rows. Exact APC also
+        # restores quality-policy float leaves (for example the final
+        # full-attention layer) as BatchKVCache objects. Mark those leaves with
+        # the same segmented-join policy used by a cold paged cache; otherwise
+        # a later request with a different prefix length attempts a dense
+        # concatenate along B before the sequence axes have been aligned.
+        from .models.cache import BatchKVCache, CacheList
+
+        def enable_segmented_join(entry):
+            if isinstance(entry, BatchKVCache):
+                entry.segment_on_extend = True
+            elif isinstance(entry, CacheList):
+                for child in entry.caches:
+                    enable_segmented_join(child)
+
+        for entry in restored:
+            enable_segmented_join(entry)
         if direct_disk_leaves:
             logger.info(
                 "Paged TurboQuant APC direct restore: leaves=%d "

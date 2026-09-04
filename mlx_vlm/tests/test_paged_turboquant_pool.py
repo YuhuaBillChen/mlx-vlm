@@ -158,6 +158,31 @@ def test_registry_restores_packed_apc_row_directly_into_existing_page_pool():
     assert bool(mx.array_equal(restored_values.indices, source.values.indices).item())
 
 
+def test_registry_marks_restored_float_tail_for_ragged_dynamic_join():
+    from mlx_vlm.models.cache import BatchKVCache
+    from mlx_vlm.turboquant import TurboQuantKVCache
+
+    registry = PagedTurboQuantPoolRegistry(
+        {0: PagedTurboQuantLayerSpec(16, H_KV)}
+    )
+    quantized = TurboQuantKVCache(bits=4)
+    quantized.update_and_fetch(*_kv(PAGE + 7))
+    float_tail = BatchKVCache([0])
+    tail_state = mx.zeros((1, H_KV, 1024, D), dtype=mx.float16)
+    float_tail.update_and_fetch(tail_state, tail_state)
+
+    restored = registry.restore_cache_list([quantized, float_tail])
+
+    assert restored[1].segment_on_extend
+    peer = BatchKVCache([0])
+    peer.segment_on_extend = True
+    peer_state = mx.zeros((1, H_KV, 3371, D), dtype=mx.float16)
+    peer.update_and_fetch(peer_state, peer_state)
+    restored[1].extend(peer)
+    assert restored[1].is_segmented
+    assert [segment.offset for segment in restored[1]._segments] == [1024, 3371]
+
+
 def test_exact_disk_restore_stays_lazy_until_streamed_into_page_pool(
     tmp_path, monkeypatch
 ):
