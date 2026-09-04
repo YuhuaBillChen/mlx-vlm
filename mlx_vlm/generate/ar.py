@@ -3338,6 +3338,8 @@ class BatchGenerator:
             "prefix_has_media": lambda pl: self._apc_prefix_has_media_tokens(
                 ids_list, pl
             ),
+            "defer_paged_q4": getattr(self, "_paged_cache_factory", None)
+            is not None,
         }
         if coordinator is not None:
             return coordinator.lookup(ids_list, **lookup_kwargs)
@@ -3525,7 +3527,16 @@ class BatchGenerator:
         if paged_factory is not None:
             if len(sequences) != 1:
                 raise ValueError("paged APC restore requires singleton prefill")
-            warm_cache = paged_factory.restore_cache_list(warm_cache)
+            try:
+                warm_cache = paged_factory.restore_cache_list(warm_cache)
+            except (OSError, TypeError, ValueError) as exc:
+                logger.warning(
+                    "Paged exact APC restore failed; falling back to cold "
+                    "prefill: %s",
+                    exc,
+                )
+                _release_cache_resources(warm_cache)
+                return None
 
         apc_meta = [
             {

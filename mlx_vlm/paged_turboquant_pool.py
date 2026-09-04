@@ -19,6 +19,7 @@ native identity.
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Hashable, Iterable, Mapping
 from contextlib import contextmanager
@@ -37,6 +38,8 @@ from .paged_turboquant_kernel import (
 )
 from .paged_turboquant_storage import PagedTurboQuantMSEStorage
 from .turboquant import DEFAULT_TURBOQUANT_SEED, _TurboQuantMSECodec
+
+logger = logging.getLogger("mlx_vlm.paged_turboquant_pool")
 
 
 @dataclass(frozen=True)
@@ -231,10 +234,13 @@ class PagedTurboQuantPoolRegistry:
         reallocates the pool.
         """
 
+        from .apc import PagedTurboQuantDiskRestore
         from .turboquant import BatchTurboQuantKVCache, TurboQuantKVCache, _slice_state
 
         restored = list(caches)
         created = []
+        direct_disk_leaves = 0
+        direct_disk_tokens = 0
         try:
             for leaf_key in self.leaf_keys:
                 if not isinstance(leaf_key, int):
@@ -242,6 +248,27 @@ class PagedTurboQuantPoolRegistry:
                         "paged APC restore currently supports top-level cache leaves"
                     )
                 source = restored[leaf_key]
+                if isinstance(source, PagedTurboQuantDiskRestore):
+                    spec = self.spec_for(leaf_key)
+                    if (
+                        source.bits != spec.bits
+                        or source.key_bits != spec.bits
+                        or source.value_bits != spec.bits
+                        or source.seed != self.seed
+                        or source.head_dim != spec.head_dim
+                    ):
+                        raise ValueError(
+                            f"warm cache leaf {leaf_key!r} does not match page pool"
+                        )
+                    target = self.new_cache(leaf_key)
+                    created.append(target)
+                    target.restore_packed_page_runs(
+                        source.iter_packed_page_runs(), source.offset
+                    )
+                    direct_disk_leaves += 1
+                    direct_disk_tokens = max(direct_disk_tokens, source.offset)
+                    restored[leaf_key] = target
+                    continue
                 if isinstance(source, BatchTurboQuantKVCache):
                     if source.batch_size != 1:
                         raise ValueError("paged APC restore requires a single warm row")
@@ -264,6 +291,13 @@ class PagedTurboQuantPoolRegistry:
             for target in created:
                 target.release()
             raise
+        if direct_disk_leaves:
+            logger.info(
+                "Paged TurboQuant APC direct restore: leaves=%d "
+                "sequence_tokens=%d contiguous_staging=0",
+                direct_disk_leaves,
+                direct_disk_tokens,
+            )
         return restored
 
     def release_cache(self, cache: PagedBatchTurboQuantKVCache) -> None:

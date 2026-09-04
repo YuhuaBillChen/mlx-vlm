@@ -522,6 +522,115 @@ class APCExactCacheEntry:
 
 
 @dataclass(frozen=True)
+class PagedTurboQuantDiskRestore:
+    """Lazy page-run source for an exact APC restore into a paged pool.
+
+    Keeping only safetensors descriptors here is intentional: materializing
+    every Q4 layer during lookup would recreate a long-context contiguous
+    staging cache before :class:`PagedTurboQuantPoolRegistry` can consume it.
+    The registry reads and releases one layer/run at a time instead.
+    """
+
+    path: Path
+    data_start: int
+    run_entries: Tuple[Tuple[dict, dict, dict, dict], ...]
+    offset: int
+    bits: float
+    key_bits: float
+    value_bits: float
+    seed: int
+    head_dim: int
+
+    @property
+    def state(self) -> tuple:
+        """No resident MLX tensors exist until the paged pool consumes us."""
+
+        return ()
+
+    def prefix_cache_merge(self, entries, prefix_lens):
+        """Pass through the only layout supported by paged APC: one row."""
+
+        if (
+            len(entries) != 1
+            or entries[0] is not self
+            or len(prefix_lens) != 1
+            or int(prefix_lens[0]) != self.offset
+        ):
+            return None
+        return self
+
+    def iter_packed_page_runs(self):
+        """Read physical page runs lazily in their on-disk page-major layout."""
+
+        for entries in self.run_entries:
+            values = tuple(
+                _read_safetensors_tensor(self.path, self.data_start, entry)
+                for entry in entries
+            )
+            if any(value is None for value in values):
+                raise OSError(f"failed to read paged APC payload from {self.path}")
+            yield values
+            # The consumer evaluates the destination write before requesting
+            # the next run. Drop our reference first so allocator cleanup does
+            # not make adjacent disk runs overlap in memory.
+            values = None
+            mx.clear_cache()
+
+    def materialize_contiguous(self, eval_targets: List[mx.array]):
+        """Compatibility path for consumers without a paged pool."""
+
+        from .turboquant import TurboQuantKVCache, TurboQuantMSEState
+
+        cache = TurboQuantKVCache(
+            bits=self.bits,
+            seed=self.seed,
+            key_bits=self.key_bits,
+            value_bits=self.value_bits,
+        )
+        if self.offset == 0:
+            return cache
+
+        def logical_chunk(value: mx.array) -> mx.array:
+            if value.ndim == 3:
+                pages, heads, width = value.shape
+                return mx.transpose(value, (1, 0, 2)).reshape(
+                    1, heads, pages * width
+                )
+            if value.ndim == 4:
+                pages, heads, width, packed = value.shape
+                return mx.transpose(value, (1, 0, 2, 3)).reshape(
+                    1, heads, pages * width, packed
+                )
+            raise ValueError("invalid paged APC tensor rank")
+
+        key_norms = []
+        key_indices = []
+        value_norms = []
+        value_indices = []
+        for kn, ki, vn, vi in self.iter_packed_page_runs():
+            eval_targets.extend((kn, ki, vn, vi))
+            key_norms.append(logical_chunk(kn))
+            key_indices.append(logical_chunk(ki))
+            value_norms.append(logical_chunk(vn))
+            value_indices.append(logical_chunk(vi))
+        keys = TurboQuantMSEState(
+            mx.concatenate(key_norms, axis=2)[..., : self.offset],
+            mx.concatenate(key_indices, axis=2)[:, :, : self.offset, :],
+        )
+        values = TurboQuantMSEState(
+            mx.concatenate(value_norms, axis=2)[..., : self.offset],
+            mx.concatenate(value_indices, axis=2)[:, :, : self.offset, :],
+        )
+        dummy = mx.zeros((1, 1, 1, self.head_dim), dtype=mx.bfloat16)
+        cache._ensure_codecs(dummy, dummy)
+        cache.keys = keys
+        cache.values = values
+        cache.offset = self.offset
+        eval_targets.extend((keys.norms, keys.indices, values.norms, values.indices))
+        return cache
+
+
+@dataclass(frozen=True)
 class _DiskLayerMajorBlock:
     """Per-block metadata for a direct layer-major disk write."""
 
@@ -1529,6 +1638,7 @@ class DiskBlockStore:
         *,
         wait_in_flight_ms: float = 0.0,
         min_capacity_tokens: Optional[int] = None,
+        defer_paged_q4: bool = False,
     ) -> Optional[Tuple[Tuple[int, ...], int, List[Any]]]:
         with self._index_lock:
             path = self._exact_index.get(cache_hash)
@@ -1542,7 +1652,9 @@ class DiskBlockStore:
             if path is None:
                 return None
         return self._load_exact_cache_file(
-            path, min_capacity_tokens=min_capacity_tokens
+            path,
+            min_capacity_tokens=min_capacity_tokens,
+            defer_paged_q4=defer_paged_q4,
         )
 
     def _load_exact_cache_file(
@@ -1550,6 +1662,7 @@ class DiskBlockStore:
         path: Path,
         *,
         min_capacity_tokens: Optional[int],
+        defer_paged_q4: bool = False,
     ) -> Optional[Tuple[Tuple[int, ...], int, List[Any]]]:
         parsed = self._open_shard_header(path)
         if parsed is None:
@@ -1582,6 +1695,7 @@ class DiskBlockStore:
                 f"c{i}",
                 min_capacity_tokens=min_capacity_tokens,
                 eval_targets=eval_targets,
+                defer_paged_q4=defer_paged_q4,
             )
             if loaded is None:
                 return None
@@ -1604,13 +1718,12 @@ class DiskBlockStore:
         *,
         min_capacity_tokens: Optional[int],
         eval_targets: List[mx.array],
+        defer_paged_q4: bool = False,
     ) -> Optional[Any]:
         from .models import cache as lm_cache
 
         kind = metadata.get(f"{prefix}_kind")
         if kind == "paged_turboquant_q4":
-            from .turboquant import TurboQuantKVCache, TurboQuantMSEState
-
             try:
                 bits = float(metadata[f"{prefix}_bits"])
                 key_bits = float(metadata[f"{prefix}_key_bits"])
@@ -1621,70 +1734,34 @@ class DiskBlockStore:
                 run_count = int(metadata.get(f"{prefix}_run_count", "0"))
             except (KeyError, TypeError, ValueError):
                 return None
-            cache = TurboQuantKVCache(
+            if offset < 0 or run_count < 0 or (offset > 0 and run_count == 0):
+                return None
+            run_entries = []
+            for run in range(run_count):
+                entries = tuple(
+                    tensor_entries.get(f"{prefix}_r{run}_{suffix}")
+                    for suffix in ("kn", "ki", "vn", "vi")
+                )
+                if any(entry is None for entry in entries):
+                    return None
+                run_entries.append(entries)
+            lazy_restore = PagedTurboQuantDiskRestore(
+                path=path,
+                data_start=data_start,
+                run_entries=tuple(run_entries),
+                offset=offset,
                 bits=bits,
-                seed=seed,
                 key_bits=key_bits,
                 value_bits=value_bits,
+                seed=seed,
+                head_dim=head_dim,
             )
-            if offset <= 0:
-                return cache
-
-            def load_run(name: str) -> Optional[mx.array]:
-                entry = tensor_entries.get(name)
-                if entry is None:
-                    return None
-                value = _read_safetensors_tensor(path, data_start, entry)
-                if value is not None:
-                    eval_targets.append(value)
-                return value
-
-            def logical_chunk(value: mx.array) -> mx.array:
-                if value.ndim == 3:
-                    pages, heads, width = value.shape
-                    return mx.transpose(value, (1, 0, 2)).reshape(
-                        1, heads, pages * width
-                    )
-                if value.ndim == 4:
-                    pages, heads, width, packed = value.shape
-                    return mx.transpose(value, (1, 0, 2, 3)).reshape(
-                        1, heads, pages * width, packed
-                    )
-                raise ValueError("invalid paged APC tensor rank")
-
-            key_norms = []
-            key_indices = []
-            value_norms = []
-            value_indices = []
+            if defer_paged_q4:
+                return lazy_restore
             try:
-                for run in range(run_count):
-                    kn = load_run(f"{prefix}_r{run}_kn")
-                    ki = load_run(f"{prefix}_r{run}_ki")
-                    vn = load_run(f"{prefix}_r{run}_vn")
-                    vi = load_run(f"{prefix}_r{run}_vi")
-                    if any(value is None for value in (kn, ki, vn, vi)):
-                        return None
-                    key_norms.append(logical_chunk(kn))
-                    key_indices.append(logical_chunk(ki))
-                    value_norms.append(logical_chunk(vn))
-                    value_indices.append(logical_chunk(vi))
-                keys = TurboQuantMSEState(
-                    mx.concatenate(key_norms, axis=2)[..., :offset],
-                    mx.concatenate(key_indices, axis=2)[:, :, :offset, :],
-                )
-                values = TurboQuantMSEState(
-                    mx.concatenate(value_norms, axis=2)[..., :offset],
-                    mx.concatenate(value_indices, axis=2)[:, :, :offset, :],
-                )
-                dummy = mx.zeros((1, 1, 1, head_dim), dtype=mx.bfloat16)
-                cache._ensure_codecs(dummy, dummy)
-                cache.keys = keys
-                cache.values = values
-                cache.offset = offset
-                eval_targets.extend([keys.norms, keys.indices, values.norms, values.indices])
-            except (TypeError, ValueError, AttributeError):
+                return lazy_restore.materialize_contiguous(eval_targets)
+            except (OSError, TypeError, ValueError, AttributeError):
                 return None
-            return cache
 
         if kind == "turboquant_kv":
             from .turboquant import TurboQuantKVCache
@@ -3298,6 +3375,7 @@ class APCManager:
         extra_hash: int = 0,
         max_prefix_tokens: Optional[int] = None,
         min_prefix_tokens: int = 0,
+        defer_paged_q4: bool = False,
     ) -> Tuple[Optional[List[Any]], int]:
         """Return an exact-prefix prompt-cache snapshot for custom caches.
 
@@ -3367,6 +3445,7 @@ class APCManager:
                 loaded = disk.load_exact_cache(
                     cache_hash,
                     min_capacity_tokens=prompt_capacity_tokens,
+                    defer_paged_q4=defer_paged_q4,
                 )
                 if loaded is not None:
                     stored_tokens, stored_extra_hash, prompt_cache = loaded
@@ -4564,6 +4643,7 @@ def apc_lookup_plan(
     safe_lookup_min: int,
     suffix_is_text_only,
     prefix_has_media,
+    defer_paged_q4: bool = False,
 ) -> Optional[dict]:
     """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
     n = len(ids_list)
@@ -4572,7 +4652,10 @@ def apc_lookup_plan(
 
     if apc_mode == "exact":
         exact_cache, exact_prefix_len = manager.lookup_exact_cache(
-            ids_list, extra_hash=extra_hash, min_prefix_tokens=safe_lookup_min
+            ids_list,
+            extra_hash=extra_hash,
+            min_prefix_tokens=safe_lookup_min,
+            defer_paged_q4=defer_paged_q4,
         )
         if exact_cache is not None and 0 < exact_prefix_len < n:
             if not suffix_is_text_only(exact_prefix_len):
@@ -4598,6 +4681,7 @@ def apc_lookup_plan(
             ids_list,
             extra_hash=extra_hash,
             min_prefix_tokens=max(prefix_len, safe_lookup_min),
+            defer_paged_q4=defer_paged_q4,
         )
     warm_cache = None
     disk_prefix_len = 0

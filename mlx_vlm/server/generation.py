@@ -2321,7 +2321,8 @@ class ResponseGenerator:
                     continue
 
                 self._step(batch_gen, active)
-                if len(active) != last_paged_active_count:
+                previous_paged_active_count = last_paged_active_count
+                if len(active) != previous_paged_active_count:
                     pool_stats_fn = getattr(batch_gen, "paged_pool_stats", None)
                     pool_stats = pool_stats_fn() if callable(pool_stats_fn) else None
                     if pool_stats is not None:
@@ -2341,12 +2342,21 @@ class ResponseGenerator:
                     and speculative_singleton_only()
                     and not batch_gen.has_pending_prompts
                     and self.requests.empty()
-                    and batch_gen.promote_ar_singleton_to_mtp()
                 ):
-                    logger.info(
-                        "Re-promoted surviving AR singleton to MTP without "
-                        "KV migration."
-                    )
+                    # A completed peer can leave B>1 attention temporaries in
+                    # MLX's allocator cache. Drop those before reloading the
+                    # singleton MTP drafter or their footprints overlap.
+                    if (
+                        previous_paged_active_count is not None
+                        and previous_paged_active_count > 1
+                    ):
+                        gc.collect()
+                        mx.clear_cache()
+                    if batch_gen.promote_ar_singleton_to_mtp():
+                        logger.info(
+                            "Re-promoted surviving AR singleton to MTP without "
+                            "KV migration."
+                        )
                 if (
                     not active
                     and batch_gen is not None

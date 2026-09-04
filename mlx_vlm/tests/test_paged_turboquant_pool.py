@@ -158,6 +158,98 @@ def test_registry_restores_packed_apc_row_directly_into_existing_page_pool():
     assert bool(mx.array_equal(restored_values.indices, source.values.indices).item())
 
 
+def test_exact_disk_restore_stays_lazy_until_streamed_into_page_pool(
+    tmp_path, monkeypatch
+):
+    from mlx_vlm import apc
+    from mlx_vlm.apc import DiskBlockStore, make_warm_batch_exact_cache_multi
+
+    layer_specs = {0: PagedTurboQuantLayerSpec(4, H_KV)}
+    source_registry = PagedTurboQuantPoolRegistry(layer_specs)
+    source = source_registry.new_cache(0)
+    source.update_and_fetch(*_kv(PAGE + 7))
+    source.synchronize()
+    expected_keys, expected_values = source.materialize(0)
+
+    disk = DiskBlockStore(tmp_path, namespace="paged-direct-restore")
+    cache_hash = 123
+    token_ids = tuple(range(PAGE + 7))
+    disk.save_exact_cache_sync(cache_hash, token_ids, 0, [source.extract_view(0)])
+
+    reads = 0
+    original_read = apc._read_safetensors_tensor
+
+    def counted_read(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(apc, "_read_safetensors_tensor", counted_read)
+    loaded = disk.load_exact_cache(cache_hash, defer_paged_q4=True)
+    assert loaded is not None
+    stored_tokens, stored_extra_hash, row = loaded
+    assert stored_tokens == token_ids
+    assert stored_extra_hash == 0
+    assert reads == 0
+
+    warm, prefix_len = make_warm_batch_exact_cache_multi(
+        [row], [len(token_ids)], consume_sources=True
+    )
+    assert prefix_len == len(token_ids)
+    assert warm is not None
+    assert reads == 0
+
+    target_registry = PagedTurboQuantPoolRegistry(layer_specs)
+    restored = target_registry.restore_cache_list(warm)
+    assert reads == 4
+    restored_keys, restored_values = restored[0].materialize(0)
+    assert bool(mx.array_equal(restored_keys.norms, expected_keys.norms).item())
+    assert bool(mx.array_equal(restored_keys.indices, expected_keys.indices).item())
+    assert bool(mx.array_equal(restored_values.norms, expected_values.norms).item())
+    assert bool(mx.array_equal(restored_values.indices, expected_values.indices).item())
+
+    # A non-paged consumer (for example the v14 singleton fork sharing this
+    # APC namespace) retains the legacy contiguous restore behavior.
+    from mlx_vlm.turboquant import TurboQuantKVCache
+
+    reads_before_compat = reads
+    compatible = disk.load_exact_cache(cache_hash)
+    assert compatible is not None
+    assert isinstance(compatible[2][0], TurboQuantKVCache)
+    assert reads == reads_before_compat + 4
+    disk.close()
+
+
+def test_streamed_page_restore_releases_reservation_after_read_failure():
+    source_registry = PagedTurboQuantPoolRegistry(
+        {0: PagedTurboQuantLayerSpec(2, H_KV)}
+    )
+    source = source_registry.new_cache(0)
+    source.update_and_fetch(*_kv(PAGE))
+    source.synchronize()
+    page_id = source._rows.rows[0].page_ids[0]
+    storage = source.storage
+
+    def failing_runs():
+        yield (
+            storage.keys.norms[page_id : page_id + 1],
+            storage.keys.indices[page_id : page_id + 1],
+            storage.values.norms[page_id : page_id + 1],
+            storage.values.indices[page_id : page_id + 1],
+        )
+        raise OSError("synthetic APC read failure")
+
+    target_registry = PagedTurboQuantPoolRegistry(
+        {0: PagedTurboQuantLayerSpec(2, H_KV)}
+    )
+    target = target_registry.new_cache(0)
+    with pytest.raises(OSError, match="synthetic APC read failure"):
+        target.restore_packed_page_runs(failing_runs(), PAGE + 1)
+
+    assert target.sequence_lengths == (0,)
+    assert target_registry.stats().used_layer_pages == 0
+
+
 def test_cross_layer_reservation_exhaustion_is_atomic_before_forward():
     registry = _registry(capacity_pages=1)
     caches = registry.new_cache_set()

@@ -250,6 +250,82 @@ class PagedTurboQuantMSEStorage:
         # The generation boundary materializes model output before scheduler
         # lifecycle code may release and recycle these physical pages.
 
+    def write_page_run(
+        self,
+        sequence: PagedSequence,
+        logical_page_start: int,
+        keys: TurboQuantMSEState,
+        values: TurboQuantMSEState,
+    ) -> int:
+        """Copy page-major packed APC payload into an existing block table."""
+
+        if (
+            not isinstance(sequence, PagedSequence)
+            or sequence.allocator is not self.allocator
+        ):
+            raise ValueError("sequence and storage must use the same allocator")
+        logical_page_start = int(logical_page_start)
+        if logical_page_start < 0:
+            raise ValueError("logical_page_start must be non-negative")
+
+        def validate(state, name, packed_width, destination):
+            if not isinstance(state, TurboQuantMSEState):
+                raise TypeError(f"{name} must be a TurboQuantMSEState")
+            if state.norms.ndim != 3 or state.indices.ndim != 4:
+                raise ValueError(f"{name} must use [pages, Hkv, P, ...] layout")
+            page_count = int(state.norms.shape[0])
+            if (
+                int(state.indices.shape[0]) != page_count
+                or int(state.norms.shape[1]) != self.kv_heads
+                or int(state.indices.shape[1]) != self.kv_heads
+                or int(state.norms.shape[2]) != self.page_size
+                or int(state.indices.shape[2]) != self.page_size
+                or int(state.indices.shape[3]) != packed_width
+            ):
+                raise ValueError(f"{name} geometry does not match the page pool")
+            if (
+                state.norms.dtype != destination.norms.dtype
+                or state.indices.dtype != destination.indices.dtype
+            ):
+                raise ValueError(f"{name} dtypes do not match the page pool")
+            return page_count
+
+        key_pages = validate(keys, "keys", self.key_packed_width, self.keys)
+        value_pages = validate(values, "values", self.value_packed_width, self.values)
+        if key_pages != value_pages:
+            raise ValueError("key/value APC page counts do not match")
+        logical_page_stop = logical_page_start + key_pages
+        if logical_page_stop > len(sequence.page_ids):
+            raise ValueError("paged APC run exceeds the reserved block table")
+        physical = sequence.page_ids[logical_page_start:logical_page_stop]
+        if any(self.allocator.refcount(page_id) != 1 for page_id in physical):
+            raise RuntimeError("cannot restore into shared pages")
+
+        source_start = 0
+        while source_start < key_pages:
+            source_stop = source_start + 1
+            while (
+                source_stop < key_pages
+                and physical[source_stop] == physical[source_stop - 1] + 1
+            ):
+                source_stop += 1
+            target_start = physical[source_start]
+            target_stop = physical[source_stop - 1] + 1
+            self.keys.norms[target_start:target_stop] = keys.norms[
+                source_start:source_stop
+            ]
+            self.keys.indices[target_start:target_stop] = keys.indices[
+                source_start:source_stop
+            ]
+            self.values.norms[target_start:target_stop] = values.norms[
+                source_start:source_stop
+            ]
+            self.values.indices[target_start:target_stop] = values.indices[
+                source_start:source_stop
+            ]
+            source_start = source_stop
+        return key_pages
+
     @staticmethod
     def _empty_materialized(
         state: TurboQuantMSEState,

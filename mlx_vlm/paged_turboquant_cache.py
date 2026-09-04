@@ -596,6 +596,43 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
         self._has_pending_writes = False
         self._invalidate_schedule()
 
+    def restore_packed_page_runs(self, runs, token_count: int) -> None:
+        """Stream page-major exact-APC runs into this row without staging KV."""
+
+        self._ensure_live()
+        if self.batch_size != 1 or not self.empty():
+            raise ValueError("paged APC restore requires one empty row")
+        if self.storage is None:
+            raise RuntimeError("paged APC restore requires registry-backed storage")
+        token_count = int(token_count)
+        if token_count < 0:
+            raise ValueError("paged APC restore length must be non-negative")
+        if token_count == 0:
+            return
+        append = self._rows.rows[0].append(token_count)
+        expected_pages = (token_count + self.cache_step - 1) // self.cache_step
+        restored_pages = 0
+        try:
+            for kn, ki, vn, vi in runs:
+                keys = TurboQuantMSEState(kn, ki)
+                values = TurboQuantMSEState(vn, vi)
+                restored_pages += self.storage.write_page_run(
+                    self._rows.rows[0], restored_pages, keys, values
+                )
+                # Bound restore peak to one disk run plus the fixed page pool.
+                mx.eval(self.storage.keys, self.storage.values)
+                del keys, values, kn, ki, vn, vi
+            if restored_pages != expected_pages:
+                raise ValueError(
+                    f"paged APC restored {restored_pages} pages, "
+                    f"expected {expected_pages}"
+                )
+        except Exception:
+            self._rows.rows[0].rollback(append)
+            raise
+        self._has_pending_writes = False
+        self._invalidate_schedule()
+
     @property
     def reference_state(self):
         """Materialized per-row state; never used by the paged decode path."""
