@@ -184,7 +184,11 @@ def _transform_modelopt_nvfp4_weights(
     if quantization_config.get("quant_method") not in {
         "modelopt",
         "modelopt_mixed",
-    } or quantization_config.get("quant_algo") not in {"NVFP4", "MIXED_PRECISION"}:
+    } or quantization_config.get("quant_algo") not in {
+        "NVFP4",
+        "W4A16_NVFP4",
+        "MIXED_PRECISION",
+    }:
         return weights, None
 
     scale_2_suffix = ".weight_scale_2"
@@ -744,6 +748,8 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
         model_type = "gliner2_5"
     elif "DFlash2DraftModel" in architectures:
         model_type = "dflash2"
+    elif "Gemma4DSparkModel" in architectures:
+        model_type = "gemma4_dspark"
     elif dflash_config is not None:
         is_dspark = (
             dflash_config.get("projector_type") == "dspark"
