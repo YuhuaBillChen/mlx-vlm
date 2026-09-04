@@ -1608,6 +1608,84 @@ class DiskBlockStore:
         from .models import cache as lm_cache
 
         kind = metadata.get(f"{prefix}_kind")
+        if kind == "paged_turboquant_q4":
+            from .turboquant import TurboQuantKVCache, TurboQuantMSEState
+
+            try:
+                bits = float(metadata[f"{prefix}_bits"])
+                key_bits = float(metadata[f"{prefix}_key_bits"])
+                value_bits = float(metadata[f"{prefix}_value_bits"])
+                seed = int(metadata.get(f"{prefix}_seed", "0"))
+                offset = int(metadata.get(f"{prefix}_offset", "0"))
+                head_dim = int(metadata[f"{prefix}_head_dim"])
+                run_count = int(metadata.get(f"{prefix}_run_count", "0"))
+            except (KeyError, TypeError, ValueError):
+                return None
+            cache = TurboQuantKVCache(
+                bits=bits,
+                seed=seed,
+                key_bits=key_bits,
+                value_bits=value_bits,
+            )
+            if offset <= 0:
+                return cache
+
+            def load_run(name: str) -> Optional[mx.array]:
+                entry = tensor_entries.get(name)
+                if entry is None:
+                    return None
+                value = _read_safetensors_tensor(path, data_start, entry)
+                if value is not None:
+                    eval_targets.append(value)
+                return value
+
+            def logical_chunk(value: mx.array) -> mx.array:
+                if value.ndim == 3:
+                    pages, heads, width = value.shape
+                    return mx.transpose(value, (1, 0, 2)).reshape(
+                        1, heads, pages * width
+                    )
+                if value.ndim == 4:
+                    pages, heads, width, packed = value.shape
+                    return mx.transpose(value, (1, 0, 2, 3)).reshape(
+                        1, heads, pages * width, packed
+                    )
+                raise ValueError("invalid paged APC tensor rank")
+
+            key_norms = []
+            key_indices = []
+            value_norms = []
+            value_indices = []
+            try:
+                for run in range(run_count):
+                    kn = load_run(f"{prefix}_r{run}_kn")
+                    ki = load_run(f"{prefix}_r{run}_ki")
+                    vn = load_run(f"{prefix}_r{run}_vn")
+                    vi = load_run(f"{prefix}_r{run}_vi")
+                    if any(value is None for value in (kn, ki, vn, vi)):
+                        return None
+                    key_norms.append(logical_chunk(kn))
+                    key_indices.append(logical_chunk(ki))
+                    value_norms.append(logical_chunk(vn))
+                    value_indices.append(logical_chunk(vi))
+                keys = TurboQuantMSEState(
+                    mx.concatenate(key_norms, axis=2)[..., :offset],
+                    mx.concatenate(key_indices, axis=2)[:, :, :offset, :],
+                )
+                values = TurboQuantMSEState(
+                    mx.concatenate(value_norms, axis=2)[..., :offset],
+                    mx.concatenate(value_indices, axis=2)[:, :, :offset, :],
+                )
+                dummy = mx.zeros((1, 1, 1, head_dim), dtype=mx.bfloat16)
+                cache._ensure_codecs(dummy, dummy)
+                cache.keys = keys
+                cache.values = values
+                cache.offset = offset
+                eval_targets.extend([keys.norms, keys.indices, values.norms, values.indices])
+            except (TypeError, ValueError, AttributeError):
+                return None
+            return cache
+
         if kind == "turboquant_kv":
             from .turboquant import TurboQuantKVCache
 
@@ -2673,6 +2751,31 @@ class DiskBlockStore:
             from .turboquant import TurboQuantKVCache, _slice_state
         except ImportError:
             TurboQuantKVCache = ()
+
+        page_runs = getattr(c, "apc_page_runs", None)
+        if callable(page_runs):
+            owner = getattr(c, "cache", None)
+            storage = getattr(owner, "storage", None)
+            if storage is None:
+                return False
+            offset = int(getattr(c, "sequence_length", 0) or 0)
+            metadata[f"{prefix}_kind"] = "paged_turboquant_q4"
+            metadata[f"{prefix}_offset"] = str(offset)
+            metadata[f"{prefix}_bits"] = str(float(owner.bits))
+            metadata[f"{prefix}_key_bits"] = str(float(owner.key_bits))
+            metadata[f"{prefix}_value_bits"] = str(float(owner.value_bits))
+            metadata[f"{prefix}_seed"] = str(int(owner.seed))
+            metadata[f"{prefix}_head_dim"] = str(
+                int(getattr(owner.key_codec, "dim", 0) or 0)
+            )
+            runs = tuple(page_runs())
+            metadata[f"{prefix}_run_count"] = str(len(runs))
+            for run, (start, stop) in enumerate(runs):
+                arrays[f"{prefix}_r{run}_kn"] = storage.keys.norms[start:stop]
+                arrays[f"{prefix}_r{run}_ki"] = storage.keys.indices[start:stop]
+                arrays[f"{prefix}_r{run}_vn"] = storage.values.norms[start:stop]
+                arrays[f"{prefix}_r{run}_vi"] = storage.values.indices[start:stop]
+            return offset == 0 or bool(runs)
 
         if isinstance(c, TurboQuantKVCache):
             offset = int(getattr(c, "offset", 0) or 0)

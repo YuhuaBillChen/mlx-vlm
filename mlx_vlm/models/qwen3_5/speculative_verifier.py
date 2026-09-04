@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from typing import Any, Optional
 
@@ -1775,16 +1776,24 @@ class Qwen3_5ExactSpeculativeVerifier:
         if (
             output is None
             and 1 < length <= 4
-            and getattr(cache, "fused_attention_eligible", False)
+            and (
+                getattr(cache, "packed_verify_eligible", False)
+                or (
+                    os.environ.get("MLX_VLM_TQ_MTP_QTILE") == "1"
+                    and getattr(cache, "fused_attention_eligible", False)
+                )
+            )
         ):
-            packed_verify = getattr(cache, "prefill_attention", None)
+            packed_verify = getattr(cache, "packed_verify_attention", None)
+            if not callable(packed_verify):
+                packed_verify = getattr(cache, "prefill_attention", None)
             if callable(packed_verify):
                 output = packed_verify(
                     queries,
                     keys_state=keys,
                     values_state=values,
                     scale=attention.scale,
-                    mask="causal",
+                    mask=mask if mask is not None else "causal",
                 )
 
         if output is None and length > 1:

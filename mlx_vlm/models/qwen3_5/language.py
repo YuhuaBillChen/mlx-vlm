@@ -824,6 +824,11 @@ def _qwen3_5_left_padded_attention(
     scale: float,
     mask: Optional[mx.array],
 ) -> Optional[mx.array]:
+    segmented_attention = getattr(cache, "segmented_attention", None)
+    if callable(segmented_attention):
+        output = segmented_attention(queries, scale=scale, mask=mask)
+        if output is not None:
+            return output
     if hasattr(cache, "bits") or queries.ndim != 4 or keys.ndim != 4:
         return None
 

@@ -140,6 +140,48 @@ def test_direct_exact_disk_write_roundtrip_is_immediately_visible(
     manager.close()
 
 
+def test_direct_exact_disk_write_borrows_paged_q4_runs_without_materialize(
+    tmp_path, monkeypatch
+):
+    from mlx_vlm.paged_turboquant_cache import PagedBatchTurboQuantKVCache
+
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "0")
+    monkeypatch.setenv("APC_EXACT_DIRECT_DISK_WRITE", "1")
+    token_ids = list(range(513))
+    paged = PagedBatchTurboQuantKVCache([0], bits=4, capacity_pages=4)
+    paged.update_and_fetch(
+        mx.random.normal((1, 2, len(token_ids), 256)).astype(mx.bfloat16),
+        mx.random.normal((1, 2, len(token_ids), 256)).astype(mx.bfloat16),
+    )
+    expected_keys, expected_values = paged.materialize(0)
+    mx.eval(expected_keys, expected_values)
+
+    monkeypatch.setattr(
+        paged,
+        "materialize",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("direct paged APC store must not materialize contiguous KV")
+        ),
+    )
+    borrowed = extract_prompt_cache_from_batch([paged], 0, detach=False)
+    disk = DiskBlockStore(tmp_path, namespace="direct-paged-exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, borrowed, extra_hash=23)
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="direct-paged-exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    warm, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=23)
+
+    assert matched == len(token_ids)
+    assert warm is not None
+    assert bool(mx.array_equal(warm[0].keys.norms, expected_keys.norms).item())
+    assert bool(mx.array_equal(warm[0].keys.indices, expected_keys.indices).item())
+    assert bool(mx.array_equal(warm[0].values.norms, expected_values.norms).item())
+    assert bool(mx.array_equal(warm[0].values.indices, expected_values.indices).item())
+    manager.close()
+
+
 def test_image_hash_preserves_tensor_shape_and_dtype():
     flat_values = mx.arange(12, dtype=mx.float32)
     first_shape = flat_values.reshape(1, 3, 2, 2)

@@ -30,9 +30,19 @@ from ..generate import (  # noqa: F401 - compatibility re-exported by server.__i
     BatchGenerator,
     _make_cache,
 )
+from ..generate.common import (
+    DEFAULT_COMPLETION_BATCH_SIZE,
+    DEFAULT_PREFILL_BATCH_SIZE,
+)
 from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
+)
+from ..models import cache as model_cache
+from ..paged_turboquant_kernel import PAGED_TURBOQUANT_PAGE_SIZE
+from ..paged_turboquant_pool import (
+    PagedTurboQuantLayerSpec,
+    PagedTurboQuantPoolRegistry,
 )
 from ..sample_utils import (
     apply_top_k,
@@ -91,6 +101,101 @@ def get_max_num_seqs():
     return n if n > 0 else None
 
 
+def get_batch_kv_slot_budget():
+    """Maximum rectangular KV token slots across an active batch.
+
+    A value of ``N`` permits a batch only while
+    ``batch_size * max(per_request_context_budget) <= N``.  The first row is
+    always admitted so this guard reduces concurrency instead of reducing the
+    server's single-request context limit.
+    """
+    raw = os.environ.get("MLX_VLM_BATCH_KV_SLOT_BUDGET", "")
+    if not raw:
+        return None
+    try:
+        budget = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid MLX_VLM_BATCH_KV_SLOT_BUDGET=%r; disabling KV-budget admission.",
+            raw,
+        )
+        return None
+    return budget if budget > 0 else None
+
+
+def paged_turboquant_enabled() -> bool:
+    return os.environ.get("MLX_VLM_PAGED_TQ", "0").lower() in ("1", "true", "yes")
+
+
+def get_paged_kv_capacity_tokens() -> Optional[int]:
+    raw = os.environ.get("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "")
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "MLX_VLM_PAGED_KV_CAPACITY_TOKENS must be a positive integer"
+        ) from exc
+    if value <= 0:
+        raise ValueError("MLX_VLM_PAGED_KV_CAPACITY_TOKENS must be positive")
+    return value
+
+
+def make_paged_turboquant_registry(language_model):
+    """Build the fixed generator-lifetime page pools for supported KV leaves."""
+
+    capacity_tokens = get_paged_kv_capacity_tokens()
+    if capacity_tokens is None:
+        raise ValueError(
+            "MLX_VLM_PAGED_KV_CAPACITY_TOKENS is required with MLX_VLM_PAGED_TQ=1"
+        )
+    max_num_seqs = get_max_num_seqs()
+    if max_num_seqs is None:
+        raise ValueError("MLX_VLM_PAGED_TQ=1 requires MLX_VLM_MAX_NUM_SEQS")
+    if not hasattr(language_model, "make_cache"):
+        raise ValueError("paged TurboQuant requires a model-defined cache layout")
+    model_args = getattr(language_model, "args", None)
+    # Qwen3.5 exposes a legacy ``head_dim`` property derived as
+    # hidden_size/num_heads, which is not the configured Q/K/V head width for
+    # models such as 5120/24 with explicit head_dim=256. Prefer model config.
+    head_dim = int(
+        getattr(model_args, "head_dim", 0)
+        or getattr(language_model, "head_dim", 0)
+    )
+    kv_heads = int(
+        getattr(
+            language_model,
+            "n_kv_heads",
+            getattr(model_args, "num_key_value_heads", 0),
+        )
+    )
+    layout = language_model.make_cache()
+    specs = {
+        index: PagedTurboQuantLayerSpec(
+            capacity_pages=(
+                capacity_tokens + PAGED_TURBOQUANT_PAGE_SIZE - 1
+            )
+            // PAGED_TURBOQUANT_PAGE_SIZE,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+        )
+        for index, entry in enumerate(layout)
+        if model_cache.should_quantize_kv_layer(index, len(layout))
+        and isinstance(
+            entry,
+            (
+                model_cache.KVCache,
+                model_cache.ChunkedKVCache,
+                model_cache.SimpleKVCache,
+            ),
+        )
+    }
+    if not specs:
+        raise ValueError("model has no supported Q4 paged KV leaves")
+    return PagedTurboQuantPoolRegistry(specs)
+
+
 def get_server_max_tokens():
     return int(os.environ.get("MLX_VLM_MAX_TOKENS", DEFAULT_MAX_TOKENS))
 
@@ -107,6 +212,22 @@ def get_speculative_batch_coalesce_s():
         return max(0.0, float(raw)) / 1000.0
     except ValueError:
         return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
+
+
+def speculative_singleton_only() -> bool:
+    return os.environ.get("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def mtp_repromotion_enabled() -> bool:
+    return os.environ.get("MLX_VLM_MTP_REPROMOTE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 def get_log_progress_interval():
@@ -758,6 +879,7 @@ class QueuedGenerationRequest:
     audio: Optional[List] = None
     apc_semantic_hash: Optional[int] = None
     request_id: Optional[str] = None
+    cancel_event: Optional[Event] = None
     queued_at: float = field(default_factory=time.perf_counter)
 
 
@@ -1030,8 +1152,6 @@ class ResponseGenerator:
             "true",
             "yes",
         )
-        if self.chunk_local_input_embeddings and get_max_num_seqs() != 1:
-            raise ValueError("Chunk-local input embeddings require --max-num-seqs 1.")
         self.kv_bits = kv_bits
         self.kv_key_bits = kv_key_bits
         self.kv_value_bits = kv_value_bits
@@ -1155,10 +1275,6 @@ class ResponseGenerator:
                         raise ValueError(
                             "Deferred drafter loading currently supports MTP only."
                         )
-                    if get_max_num_seqs() != 1:
-                        raise ValueError(
-                            "Deferred drafter loading requires --max-num-seqs 1."
-                        )
                     draft_model = LazyDrafter(
                         path=draft_model_path,
                         kind=draft_kind,
@@ -1190,8 +1306,6 @@ class ResponseGenerator:
             "MLX_VLM_VISION_PHASE_SWAP_PATH"
         )
         if vision_component:
-            if get_max_num_seqs() != 1:
-                raise ValueError("Vision phase swap requires --max-num-seqs 1.")
             self.vision_phase_swap = VisionTowerPhaseSwap(model, vision_component)
         language_head_component = os.environ.get(
             "MLX_VLM_LANGUAGE_HEAD_PHASE_SWAP_PATH"
@@ -1205,9 +1319,7 @@ class ResponseGenerator:
             language_model.prefill_head_phase_swap = LanguageHeadPhaseSwap(
                 language_model, language_head_component
             )
-        embedding_component = os.environ.get(
-            "MLX_VLM_INPUT_EMBEDDING_PHASE_SWAP_PATH"
-        )
+        embedding_component = os.environ.get("MLX_VLM_INPUT_EMBEDDING_PHASE_SWAP_PATH")
         if embedding_component:
             if get_max_num_seqs() != 1:
                 raise ValueError("Embedding phase swap requires --max-num-seqs 1.")
@@ -1232,6 +1344,7 @@ class ResponseGenerator:
         audio: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
         videos: Optional[List] = None,
+        cancel_event: Optional[Event] = None,
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
@@ -1289,6 +1402,7 @@ class ResponseGenerator:
             audio=audio,
             apc_semantic_hash=apc_semantic_hash,
             request_id=request_id,
+            cancel_event=cancel_event,
             queued_at=request_started_at,
         )
         logger.info(
@@ -1304,7 +1418,14 @@ class ResponseGenerator:
         self.requests.put(queued_request)
 
         # Block until the GPU thread sends back the context
-        ctx = rqueue.get()
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("Generation cancelled before GPU admission.")
+            try:
+                ctx = rqueue.get(timeout=0.1 if cancel_event is not None else None)
+                break
+            except QueueEmpty:
+                continue
         if isinstance(ctx, Exception):
             raise ctx
 
@@ -1777,6 +1898,137 @@ class ResponseGenerator:
 
         return pending, should_stop
 
+    def _uses_phase_cohort_admission(self) -> bool:
+        """Keep phase-swapped prefills out of an active decode cohort."""
+        return bool(
+            getattr(self, "chunk_local_input_embeddings", False)
+            or getattr(self, "vision_phase_swap", None) is not None
+            or isinstance(getattr(self, "draft_model", None), LazyDrafter)
+        )
+
+    @staticmethod
+    def _is_text_only_request(request: QueuedGenerationRequest) -> bool:
+        return not (request.images or request.audio or request.videos)
+
+    @staticmethod
+    def _request_cancelled_before_admission(
+        request: QueuedGenerationRequest,
+    ) -> bool:
+        event = getattr(request, "cancel_event", None)
+        return event is not None and event.is_set()
+
+    def _collect_active_phase_text_requests(self, capacity: Optional[int]):
+        """Admit queued text rows while leaving media at the cohort boundary."""
+        admitted = []
+        deferred = []
+        should_stop = False
+        scan = self.requests.qsize()
+
+        for _ in range(scan):
+            try:
+                item = self.requests.get_nowait()
+            except QueueEmpty:
+                break
+            if item is None:
+                deferred.append(item)
+                continue
+            if self._request_cancelled_before_admission(item):
+                logger.info(
+                    "Dropped cancelled queued request before phase admission: "
+                    "request=%s",
+                    self._request_log_id(item),
+                )
+                continue
+            if (
+                capacity is None or len(admitted) < capacity
+            ) and self._is_text_only_request(item):
+                admitted.append(item)
+            else:
+                deferred.append(item)
+
+        for item in deferred:
+            self.requests.put(item)
+        if self._stop and not admitted and not deferred:
+            should_stop = True
+        return admitted, should_stop
+
+    def _admission_capacity(
+        self, *, active_count: int, max_num_seqs: Optional[int]
+    ) -> Optional[int]:
+        if (
+            active_count
+            and self._uses_phase_cohort_admission()
+            and getattr(self, "draft_model", None) is not None
+            and getattr(self, "draft_kind", None) != "mtp"
+        ):
+            return 0
+        if max_num_seqs is None:
+            return None
+        return max(0, max_num_seqs - active_count)
+
+    @staticmethod
+    def _request_context_budget(request: QueuedGenerationRequest) -> int:
+        return max(0, int(request.prompt_tokens)) + max(
+            0, int(request.args.max_tokens or 0)
+        )
+
+    def _partition_kv_budget_admission(self, pending, active):
+        """Admit a FIFO prefix that fits the active KV storage budget.
+
+        Dense/segmented compatibility mode retains the conservative rectangular
+        projection. Paged mode reserves only real per-request token budgets,
+        including requested output, because rows do not inherit one another's
+        maximum sequence capacity.
+        """
+        paged = paged_turboquant_enabled()
+        slot_budget = (
+            get_paged_kv_capacity_tokens() if paged else get_batch_kv_slot_budget()
+        )
+        if slot_budget is None or not pending:
+            return list(pending), []
+
+        context_budgets = []
+        for info in active.values():
+            value = info.get("context_budget_tokens")
+            if value is None:
+                logger.warning(
+                    "Deferring KV-budget admission because an active request "
+                    "has no context budget metadata."
+                )
+                return [], list(pending)
+            context_budgets.append(max(0, int(value)))
+
+        admitted = []
+        for index, request in enumerate(pending):
+            request_budget = self._request_context_budget(request)
+            if not context_budgets:
+                # Let the first request reach cache allocation even if it is
+                # oversized, where it receives an explicit allocation error
+                # instead of waiting forever in the queue.
+                admitted.append(request)
+                context_budgets.append(request_budget)
+                continue
+
+            projected = context_budgets + [request_budget]
+            projected_slots = (
+                sum(
+                    (
+                        value + PAGED_TURBOQUANT_PAGE_SIZE - 1
+                    )
+                    // PAGED_TURBOQUANT_PAGE_SIZE
+                    * PAGED_TURBOQUANT_PAGE_SIZE
+                    for value in projected
+                )
+                if paged
+                else len(projected) * max(projected, default=0)
+            )
+            if projected_slots > slot_budget:
+                return admitted, list(pending[index:])
+            admitted.append(request)
+            context_budgets.append(request_budget)
+
+        return admitted, []
+
     def _run(self):
         try:
             self._run_impl()
@@ -1805,7 +2057,10 @@ class ResponseGenerator:
         batch_gen = None
         # uid -> {rqueue, tokens, gen_kwargs}
         active: dict = {}
+        last_paged_active_count = None
+        last_kv_deferral_signature = None
         max_num_seqs = get_max_num_seqs()
+        phase_cohorts = self._uses_phase_cohort_admission()
 
         while not (self._stop and not active and self.requests.empty()):
             new_items = []
@@ -1815,22 +2070,87 @@ class ResponseGenerator:
                 active_batch = bool(active)
                 coalesce_s = (
                     get_speculative_batch_coalesce_s()
-                    if not active_batch and self.draft_model is not None
+                    if not active_batch
+                    and (self.draft_model is not None or phase_cohorts)
                     else 0.0
                 )
-                capacity = (
-                    None if max_num_seqs is None else max(0, max_num_seqs - len(active))
+                capacity = self._admission_capacity(
+                    active_count=len(active), max_num_seqs=max_num_seqs
                 )
-                new_items, should_stop = self._collect_pending_requests(
-                    active=active_batch,
-                    capacity=capacity,
-                    coalesce_s=coalesce_s,
+                if (
+                    active_batch
+                    and phase_cohorts
+                    and (capacity is None or capacity > 0)
+                ):
+                    new_items, should_stop = self._collect_active_phase_text_requests(
+                        capacity
+                    )
+                else:
+                    new_items, should_stop = self._collect_pending_requests(
+                        active=active_batch,
+                        capacity=capacity,
+                        coalesce_s=coalesce_s,
+                    )
+                live_items = []
+                for item in new_items:
+                    if self._request_cancelled_before_admission(item):
+                        logger.info(
+                            "Dropped cancelled queued request before GPU "
+                            "admission: request=%s",
+                            self._request_log_id(item),
+                        )
+                    else:
+                        live_items.append(item)
+                new_items = live_items
+                new_items, deferred_items = self._partition_kv_budget_admission(
+                    new_items, active
                 )
+                if deferred_items:
+                    deferral_signature = (
+                        len(active),
+                        tuple(self._request_log_id(item) for item in deferred_items),
+                    )
+                    if deferral_signature != last_kv_deferral_signature:
+                        logger.info(
+                            "KV admission deferred: active=%d admitted=%d "
+                            "deferred=%d capacity_tokens=%s",
+                            len(active),
+                            len(new_items),
+                            len(deferred_items),
+                            get_paged_kv_capacity_tokens()
+                            if paged_turboquant_enabled()
+                            else get_batch_kv_slot_budget(),
+                        )
+                        last_kv_deferral_signature = deferral_signature
+                else:
+                    last_kv_deferral_signature = None
+                for item in deferred_items:
+                    self.requests.put(item)
                 if should_stop and not active:
                     break
 
+                if (
+                    new_items
+                    and active
+                    and batch_gen is not None
+                    and speculative_singleton_only()
+                    and batch_gen.demote_mtp_to_ar()
+                ):
+                    self._unload_deferred_drafter()
+                    gc.collect()
+                    mx.clear_cache()
+                    logger.info(
+                        "Demoted active MTP cohort to AR before batch admission."
+                    )
+
                 # Drop abandoned requests before doing more work.
                 cancelled = self._drain_cancellations()
+                cancelled.update(
+                    uid
+                    for uid, info in active.items()
+                    if info.get("cancel_event") is not None
+                    and info["cancel_event"].is_set()
+                )
                 if cancelled and batch_gen is not None:
                     for uid in cancelled:
                         if uid in active:
@@ -1857,6 +2177,13 @@ class ResponseGenerator:
                         self._unload_deferred_drafter()
 
                 for request in new_items:
+                    if self._request_cancelled_before_admission(request):
+                        logger.info(
+                            "Dropped cancelled queued request before embedding: "
+                            "request=%s",
+                            self._request_log_id(request),
+                        )
+                        continue
                     rqueue = request.rqueue
                     raw_inputs = request.raw_inputs
                     prompt_tokens = request.prompt_tokens
@@ -1866,6 +2193,25 @@ class ResponseGenerator:
                         request, backend="continuous_batching"
                     )
                     if batch_gen is None:
+                        paged_registry = None
+                        if paged_turboquant_enabled():
+                            paged_registry = make_paged_turboquant_registry(
+                                self.model.language_model
+                            )
+                            logger.info(
+                                "Paged TurboQuant enabled: capacity_tokens=%d "
+                                "pageable_layers=%d max_num_seqs=%d; APC=%s; "
+                                "singleton-only MTP=%s",
+                                get_paged_kv_capacity_tokens(),
+                                len(paged_registry.leaf_keys),
+                                get_max_num_seqs(),
+                                self.apc_manager is not None,
+                                bool(
+                                    self.draft_model is not None
+                                    and self.draft_kind == "mtp"
+                                    and speculative_singleton_only()
+                                ),
+                            )
                         batch_gen = BatchGenerator(
                             self.model.language_model,
                             self.processor,
@@ -1888,6 +2234,17 @@ class ResponseGenerator:
                             draft_block_size=_get_draft_block_size_from_env(),
                             greedy_sampling=args.temperature == 0,
                             prefill_step_size=self._effective_prefill_step_size(),
+                            prefill_batch_size=(
+                                1
+                                if paged_registry is not None
+                                else DEFAULT_PREFILL_BATCH_SIZE
+                            ),
+                            completion_batch_size=(
+                                get_max_num_seqs()
+                                if paged_registry is not None
+                                else DEFAULT_COMPLETION_BATCH_SIZE
+                            ),
+                            paged_cache_factory=paged_registry,
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
@@ -1949,6 +2306,9 @@ class ResponseGenerator:
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                         "prompt_tps": None,
                         "cached_tokens": 0,
+                        "cancel_event": request.cancel_event,
+                        "context_budget_tokens": max(0, int(prompt_tokens))
+                        + max(0, int(args.max_tokens or 0)),
                         "spec_snapshot": (
                             speculative_stats_snapshot(self.draft_model)
                             if self.draft_model is not None
@@ -1961,6 +2321,32 @@ class ResponseGenerator:
                     continue
 
                 self._step(batch_gen, active)
+                if len(active) != last_paged_active_count:
+                    pool_stats_fn = getattr(batch_gen, "paged_pool_stats", None)
+                    pool_stats = pool_stats_fn() if callable(pool_stats_fn) else None
+                    if pool_stats is not None:
+                        logger.info(
+                            "Paged TurboQuant pool state: active=%d used_pages=%d "
+                            "free_pages=%d high_water_pages=%d capacity_pages=%d",
+                            len(active),
+                            pool_stats.used_layer_pages,
+                            pool_stats.free_layer_pages,
+                            pool_stats.high_water_layer_pages,
+                            pool_stats.capacity_layer_pages,
+                        )
+                    last_paged_active_count = len(active)
+                if (
+                    len(active) == 1
+                    and mtp_repromotion_enabled()
+                    and speculative_singleton_only()
+                    and not batch_gen.has_pending_prompts
+                    and self.requests.empty()
+                    and batch_gen.promote_ar_singleton_to_mtp()
+                ):
+                    logger.info(
+                        "Re-promoted surviving AR singleton to MTP without "
+                        "KV migration."
+                    )
                 if (
                     not active
                     and batch_gen is not None

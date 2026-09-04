@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from threading import Event as ThreadEvent
 from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
@@ -1039,6 +1040,7 @@ async def responses_endpoint(request: Request):
             async def stream_generator():
                 token_iterator = None
                 token_iter = None  # For ResponseGenerator cleanup
+                pre_context_cancel = ThreadEvent()
                 metrics_finalized = False
                 metrics = GenerationMetrics()
                 finish_reason = None
@@ -1124,6 +1126,7 @@ async def responses_endpoint(request: Request):
                             images if images else None,
                             None,  # audio
                             gen_args,
+                            cancel_event=pre_context_cancel,
                         )
                         usage_stats["input_tokens"] = ctx.prompt_tokens
 
@@ -1396,6 +1399,7 @@ async def responses_endpoint(request: Request):
                     yield f"data: {error_data}\n\n"
 
                 finally:
+                    pre_context_cancel.set()
                     if token_iter is not None:
                         try:
                             token_iter.close()
@@ -1793,6 +1797,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             async def stream_generator():
                 token_iterator = None
                 token_iter = None  # For ResponseGenerator cleanup
+                pre_context_cancel = ThreadEvent()
                 metrics_finalized = False
                 metrics = GenerationMetrics()
                 finish_reason = None
@@ -1809,7 +1814,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
                     if runtime.response_generator is not None:
                         # generate() does blocking Queue.get — run off event loop
-                        generate_kwargs = {"args": gen_args}
+                        generate_kwargs = {
+                            "args": gen_args,
+                            "cancel_event": pre_context_cancel,
+                        }
                         if videos:
                             generate_kwargs["videos"] = videos
                         ctx, token_iter = await asyncio.to_thread(
@@ -2109,6 +2117,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     yield f"data: {error_data}\n\n"
 
                 finally:
+                    pre_context_cancel.set()
                     # Close the token iterator to trigger cleanup (important for ResponseGenerator)
                     if token_iter is not None:
                         try:

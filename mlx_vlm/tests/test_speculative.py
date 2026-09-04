@@ -1033,7 +1033,21 @@ def test_qwen_target_verify_affine_linears_fuse_exactly(
     assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
 
 
-def test_qwen_exact_verifier_routes_short_turboquant_attention_as_one_tile():
+@pytest.mark.parametrize(
+    ("eligibility", "qtile_enabled"),
+    [
+        ("fused_attention_eligible", True),
+        ("packed_verify_eligible", True),
+        ("packed_verify_eligible", False),
+    ],
+)
+def test_qwen_exact_verifier_routes_short_turboquant_attention_as_one_tile(
+    eligibility, qtile_enabled, monkeypatch
+):
+    if qtile_enabled:
+        monkeypatch.setenv("MLX_VLM_TQ_MTP_QTILE", "1")
+    else:
+        monkeypatch.delenv("MLX_VLM_TQ_MTP_QTILE", raising=False)
     calls = []
     queries = mx.ones((1, 1, 4, 8), dtype=mx.float32)
     gate = mx.zeros((1, 4, 8), dtype=mx.float32)
@@ -1053,11 +1067,12 @@ def test_qwen_exact_verifier_routes_short_turboquant_attention_as_one_tile():
             return x
 
     class Cache:
-        fused_attention_eligible = True
-
         def prefill_attention(self, q, **kwargs):
             calls.append((q, kwargs))
             return expected
+
+    cache = Cache()
+    setattr(cache, eligibility, True)
 
     attention = SimpleNamespace(
         q_proj=None,
@@ -1078,7 +1093,7 @@ def test_qwen_exact_verifier_routes_short_turboquant_attention_as_one_tile():
         attention,
         mx.zeros((1, 4, 8), dtype=mx.float32),
         "causal",
-        Cache(),
+        cache,
         None,
         None,
     )
@@ -2505,6 +2520,67 @@ def test_mtp_rounds_skips_rollback_after_full_accept_with_gdn_states():
         )
 
     assert rollback_calls == []
+
+
+def test_mtp_batch_finishes_rollback_before_yielding_round(monkeypatch):
+    events = []
+
+    class Draft:
+        def __init__(self):
+            self.config = SimpleNamespace(block_size=3)
+            self.accept_lens = []
+            self.draft_lens = []
+
+        def reset(self, model):
+            events.append("reset")
+
+        def set_shared_kv(self, *args, **kwargs):
+            events.append("bind")
+
+    class LM:
+        def rollback_speculative_cache(self, *args):
+            events.append("rollback")
+
+        def speculative_draft_hidden(self, hidden):
+            return hidden
+
+    verify = mtp_utils._MTPVerifyResult(
+        hidden=mx.zeros((1, 3, 2), dtype=mx.float32),
+        shared_kv_states={},
+        target_tokens=mx.array([[9, 9, 9]], dtype=mx.int32),
+        gdn_states=None,
+    )
+    monkeypatch.setattr(
+        mtp_utils,
+        "_mtp_draft_block_active",
+        lambda *args, **kwargs: mx.array([[7, 8]], dtype=mx.int32),
+    )
+    monkeypatch.setattr(mtp_utils, "_mtp_verify_target", lambda *args, **kwargs: verify)
+    monkeypatch.setattr(
+        mtp_utils,
+        "_speculative_walk_batch",
+        lambda *args, **kwargs: ([0], [[9]]),
+    )
+
+    rounds = mtp_utils._mtp_rounds_batch(
+        SimpleNamespace(language_model=LM()),
+        Draft(),
+        [SimpleNamespace(offset=mx.array([5]))],
+        mx.zeros((1, 1, 2), dtype=mx.float32),
+        {},
+        first_bonus=mx.array([1], dtype=mx.int32),
+        max_tokens=2,
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        draft_block_size=3,
+        token_dtype=mx.int32,
+        greedy_sampling=True,
+    )
+
+    tokens, metadata = next(rounds)
+
+    assert tokens == [9]
+    assert metadata == {"round_pos": 0, "round_len": 1}
+    assert "rollback" in events
 
 
 def test_mtp_next_block_size_can_prefer_requested_size():
