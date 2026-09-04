@@ -127,6 +127,36 @@ def paged_turboquant_enabled() -> bool:
     return os.environ.get("MLX_VLM_PAGED_TQ", "0").lower() in ("1", "true", "yes")
 
 
+def paged_scheduler_enabled() -> bool:
+    return paged_turboquant_enabled() and os.environ.get(
+        "MLX_VLM_PAGED_SCHEDULER", "0"
+    ).lower() in ("1", "true", "yes")
+
+
+def get_paged_scheduler_scan_limit() -> int:
+    raw = os.environ.get("MLX_VLM_PAGED_SCHEDULER_SCAN_LIMIT", "32")
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid MLX_VLM_PAGED_SCHEDULER_SCAN_LIMIT=%r; using 32.", raw
+        )
+        return 32
+    return max(1, value)
+
+
+def get_paged_scheduler_max_bypass() -> int:
+    raw = os.environ.get("MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS", "8")
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS=%r; using 8.", raw
+        )
+        return 8
+    return max(0, value)
+
+
 def get_paged_kv_capacity_tokens() -> Optional[int]:
     raw = os.environ.get("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "")
     if not raw:
@@ -890,6 +920,7 @@ class QueuedGenerationRequest:
     request_id: Optional[str] = None
     cancel_event: Optional[Event] = None
     queued_at: float = field(default_factory=time.perf_counter)
+    kv_bypass_count: int = 0
 
 
 @dataclass
@@ -1981,13 +2012,17 @@ class ResponseGenerator:
             0, int(request.args.max_tokens or 0)
         )
 
-    def _partition_kv_budget_admission(self, pending, active):
-        """Admit a FIFO prefix that fits the active KV storage budget.
+    def _partition_kv_budget_admission(
+        self, pending, active, admission_capacity: Optional[int] = None
+    ):
+        """Admit requests that fit the active KV storage and lane budgets.
 
         Dense/segmented compatibility mode retains the conservative rectangular
         projection. Paged mode reserves only real per-request token budgets,
         including requested output, because rows do not inherit one another's
-        maximum sequence capacity.
+        maximum sequence capacity. The optional paged scheduler may bypass a
+        temporarily blocked request to fill a free lane, with a bounded bypass
+        count that eventually restores strict FIFO ordering.
         """
         paged = paged_turboquant_enabled()
         slot_budget = (
@@ -2008,7 +2043,18 @@ class ResponseGenerator:
             context_budgets.append(max(0, int(value)))
 
         admitted = []
+        deferred = []
+        work_conserving = paged and paged_scheduler_enabled()
+        max_bypass = get_paged_scheduler_max_bypass()
+        fairness_blocked = False
+        admitted_indexes = []
         for index, request in enumerate(pending):
+            if admission_capacity is not None and len(admitted) >= admission_capacity:
+                deferred.extend(pending[index:])
+                break
+            if fairness_blocked:
+                deferred.append(request)
+                continue
             request_budget = self._request_context_budget(request)
             if not context_budgets:
                 # Let the first request reach cache allocation even if it is
@@ -2016,6 +2062,7 @@ class ResponseGenerator:
                 # instead of waiting forever in the queue.
                 admitted.append(request)
                 context_budgets.append(request_budget)
+                admitted_indexes.append(index)
                 continue
 
             projected = context_budgets + [request_budget]
@@ -2032,11 +2079,29 @@ class ResponseGenerator:
                 else len(projected) * max(projected, default=0)
             )
             if projected_slots > slot_budget:
-                return admitted, list(pending[index:])
+                deferred.append(request)
+                if not work_conserving:
+                    deferred.extend(pending[index + 1 :])
+                    break
+                if int(getattr(request, "kv_bypass_count", 0)) >= max_bypass:
+                    fairness_blocked = True
+                continue
             admitted.append(request)
             context_budgets.append(request_budget)
+            admitted_indexes.append(index)
 
-        return admitted, []
+        if work_conserving and admitted_indexes:
+            last_admitted = max(admitted_indexes)
+            admitted_ids = {id(request) for request in admitted}
+            for index, request in enumerate(pending):
+                if index >= last_admitted:
+                    break
+                if id(request) not in admitted_ids:
+                    request.kv_bypass_count = (
+                        int(getattr(request, "kv_bypass_count", 0)) + 1
+                    )
+
+        return admitted, deferred
 
     def _run(self):
         try:
@@ -2086,18 +2151,23 @@ class ResponseGenerator:
                 capacity = self._admission_capacity(
                     active_count=len(active), max_num_seqs=max_num_seqs
                 )
+                collection_capacity = capacity
+                if paged_scheduler_enabled() and (
+                    capacity is None or capacity > 0
+                ):
+                    collection_capacity = get_paged_scheduler_scan_limit()
                 if (
                     active_batch
                     and phase_cohorts
                     and (capacity is None or capacity > 0)
                 ):
                     new_items, should_stop = self._collect_active_phase_text_requests(
-                        capacity
+                        collection_capacity
                     )
                 else:
                     new_items, should_stop = self._collect_pending_requests(
                         active=active_batch,
-                        capacity=capacity,
+                        capacity=collection_capacity,
                         coalesce_s=coalesce_s,
                     )
                 live_items = []
@@ -2112,7 +2182,7 @@ class ResponseGenerator:
                         live_items.append(item)
                 new_items = live_items
                 new_items, deferred_items = self._partition_kv_budget_admission(
-                    new_items, active
+                    new_items, active, admission_capacity=capacity
                 )
                 if deferred_items:
                     deferral_signature = (

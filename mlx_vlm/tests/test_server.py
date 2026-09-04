@@ -1039,6 +1039,90 @@ def test_paged_kv_budget_accounts_for_each_requests_tail_page(monkeypatch):
     assert deferred == [one_token]
 
 
+def test_paged_scheduler_fills_free_lane_with_short_request_behind_long(
+    monkeypatch,
+):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "2048")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS", "8")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {1: {"context_budget_tokens": 1024}}
+    long_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1280,
+        args=server_generation.GenerationArguments(max_tokens=1),
+    )
+    short_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=128,
+        args=server_generation.GenerationArguments(max_tokens=1),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [long_request, short_request], active=active, admission_capacity=1
+    )
+
+    assert admitted == [short_request]
+    assert deferred == [long_request]
+    assert long_request.kv_bypass_count == 1
+
+
+def test_paged_scheduler_stops_bypassing_aged_request(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "2048")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS", "1")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {1: {"context_budget_tokens": 1024}}
+    long_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1280,
+        args=server_generation.GenerationArguments(max_tokens=1),
+        kv_bypass_count=1,
+    )
+    short_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=128,
+        args=server_generation.GenerationArguments(max_tokens=1),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [long_request, short_request], active=active, admission_capacity=1
+    )
+
+    assert admitted == []
+    assert deferred == [long_request, short_request]
+    assert long_request.kv_bypass_count == 1
+
+
+def test_paged_scheduler_respects_active_lane_capacity(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "4096")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER", "1")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    pending = [
+        server_generation.QueuedGenerationRequest(
+            rqueue=Queue(),
+            raw_inputs={},
+            prompt_tokens=128,
+            args=server_generation.GenerationArguments(max_tokens=1),
+        )
+        for _ in range(2)
+    ]
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        pending, active={}, admission_capacity=1
+    )
+
+    assert admitted == [pending[0]]
+    assert deferred == [pending[1]]
+
+
 def test_kv_budget_opportunistically_admits_until_projected_rectangle_is_full(
     monkeypatch,
 ):
