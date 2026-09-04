@@ -422,6 +422,15 @@ def _check_configured_context_budget(prompt_tokens: int, max_tokens: int):
             f"({prompt_tokens} prompt + {max_tokens} max generation), "
             f"but MAX_KV_SIZE is {context_limit}."
         )
+    if paged_turboquant_enabled():
+        pool_capacity = get_paged_kv_capacity_tokens()
+        if pool_capacity is not None and requested_tokens > pool_capacity:
+            raise PromptTooLongError(
+                "Request needs "
+                f"{requested_tokens} context tokens "
+                f"({prompt_tokens} prompt + {max_tokens} max generation), "
+                f"but paged KV pool capacity is {pool_capacity}."
+            )
 
 
 def get_quantized_kv_start():
@@ -2635,7 +2644,7 @@ class ResponseGenerator:
         videos: Optional[List] = None,
     ):
         """Validate request size before opening a streaming response."""
-        if get_configured_context_limit() is None:
+        if get_configured_context_limit() is None and not paged_turboquant_enabled():
             return
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())

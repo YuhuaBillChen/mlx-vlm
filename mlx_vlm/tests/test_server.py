@@ -5091,6 +5091,49 @@ class TestResponseGenerator:
         assert gen.requests.empty()
         image_hash.assert_not_called()
 
+    def test_generate_rejects_single_request_over_paged_pool_capacity(
+        self, monkeypatch
+    ):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen.draft_model = None
+        gen.apc_manager = None
+        gen.apc_mode = None
+        gen._preprocess_request = lambda prompt, images, audio, videos: {
+            "input_ids": mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+        }
+        gen.requests = Queue()
+
+        monkeypatch.delenv("MAX_KV_SIZE", raising=False)
+        monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+        monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "256")
+
+        with pytest.raises(
+            server.PromptTooLongError,
+            match=r"257 context tokens.*paged KV pool capacity is 256",
+        ):
+            gen.generate("prompt", args=server.GenerationArguments(max_tokens=252))
+
+        assert gen.requests.empty()
+
+    def test_stream_validation_checks_paged_pool_without_max_kv_size(
+        self, monkeypatch
+    ):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen._preprocess_request = lambda prompt, images, audio, videos: {
+            "input_ids": mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+        }
+
+        monkeypatch.delenv("MAX_KV_SIZE", raising=False)
+        monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+        monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "256")
+
+        with pytest.raises(server.PromptTooLongError, match="paged KV pool"):
+            gen.validate_context_budget(
+                "prompt", args=server.GenerationArguments(max_tokens=252)
+            )
+
     def test_generate_serializes_budget_criteria_with_tokenizer_preprocessing(self):
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         gen.wait_until_ready = lambda: None
