@@ -69,6 +69,21 @@ def test_turboquant_decode_reserve_is_layerwise_and_opt_in(monkeypatch):
     ]
 
 
+def test_turboquant_decode_reserve_accepts_fixed_capacity_cache(
+    monkeypatch, caplog
+):
+    class FixedCapacity:
+        decode_capacity_is_fixed = True
+
+    monkeypatch.setenv("MLX_VLM_TQ_RESERVE_DECODE", "1")
+    with caplog.at_level(logging.INFO):
+        assert ar_module._reserve_turboquant_decode_capacity(
+            [FixedCapacity()], 512
+        ) == 0
+    assert "skipped for fixed-capacity caches" in caplog.text
+    assert "no cache supports it" not in caplog.text
+
+
 def test_warm_prompt_reserve_is_layerwise_and_only_evals_growth(monkeypatch):
     events = []
 

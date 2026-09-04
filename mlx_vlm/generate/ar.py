@@ -115,12 +115,16 @@ def _reserve_turboquant_decode_capacity(prompt_cache, max_tokens: int) -> int:
     if max_tokens == 0:
         return 0
     reserved = 0
+    fixed_capacity = 0
     started = time.perf_counter()
     pending = list(prompt_cache)
     cache_types = []
     while pending:
         cache_entry = pending.pop(0)
         cache_types.append(type(cache_entry).__name__)
+        if getattr(cache_entry, "decode_capacity_is_fixed", False):
+            fixed_capacity += 1
+            continue
         reserve = getattr(cache_entry, "reserve_for_append", None)
         if not callable(reserve):
             if isinstance(cache_entry, cache.CacheList):
@@ -135,6 +139,11 @@ def _reserve_turboquant_decode_capacity(prompt_cache, max_tokens: int) -> int:
             reserved,
             max_tokens,
             time.perf_counter() - started,
+        )
+    elif fixed_capacity:
+        logger.info(
+            "TurboQuant decode reserve skipped for fixed-capacity caches: layers=%d",
+            fixed_capacity,
         )
     else:
         logger.warning(

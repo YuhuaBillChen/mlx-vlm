@@ -79,6 +79,9 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
     """Own one layer's ordered request rows in a shared Q4 page pool."""
 
     cache_step = PAGED_TURBOQUANT_PAGE_SIZE
+    # Physical storage is allocated once by the generator-scoped page pool;
+    # decode appends only reserve logical pages from that fixed capacity.
+    decode_capacity_is_fixed = True
 
     def __init__(
         self,
