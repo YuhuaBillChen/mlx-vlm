@@ -1123,6 +1123,55 @@ def test_paged_scheduler_respects_active_lane_capacity(monkeypatch):
     assert deferred == [pending[1]]
 
 
+def test_paged_scheduler_drains_large_queue_without_starving_head(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "4096")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS", "8")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    long_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=2304,
+        args=server_generation.GenerationArguments(max_tokens=1),
+        request_id="long-head",
+    )
+    waiting = [long_request]
+    waiting.extend(
+        server_generation.QueuedGenerationRequest(
+            rqueue=Queue(),
+            raw_inputs={},
+            prompt_tokens=64 + index,
+            args=server_generation.GenerationArguments(max_tokens=1),
+            request_id=f"short-{index}",
+        )
+        for index in range(99)
+    )
+    active = {1: {"context_budget_tokens": 2048}}
+    completed = []
+    blocked_rounds = 0
+
+    for round_index in range(200):
+        window, tail = waiting[:32], waiting[32:]
+        admitted, deferred = gen._partition_kv_budget_admission(
+            window, active=active, admission_capacity=1
+        )
+        waiting = deferred + tail
+        if admitted:
+            completed.extend(request.request_id for request in admitted)
+        else:
+            blocked_rounds += 1
+        if round_index == 9:
+            active = {}
+        if not waiting:
+            break
+
+    assert len(completed) == 100
+    assert len(set(completed)) == 100
+    assert completed.index("long-head") == 8
+    assert blocked_rounds == 2
+
+
 def test_kv_budget_opportunistically_admits_until_projected_rectangle_is_full(
     monkeypatch,
 ):
