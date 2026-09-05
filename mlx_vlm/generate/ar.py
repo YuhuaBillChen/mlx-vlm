@@ -3816,6 +3816,9 @@ class BatchGenerator:
                         "Cannot admit an autoregressive peer into the active "
                         "speculative generation batch."
                     )
+                logger.info(
+                    "Demoted active MTP cohort to AR before cold peer admission."
+                )
             self._generation_batch.extend(gen_batch)
 
     def _next(self, **kwargs):

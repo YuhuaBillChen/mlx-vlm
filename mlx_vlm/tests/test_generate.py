@@ -1678,10 +1678,11 @@ class TestBatchGenerator:
         assert gen._draft_for_prompt_batch(1) == (None, None, None)
 
     def test_cold_peer_demotes_active_singleton_mtp_before_ar_join(
-        self, monkeypatch, mock_model, mock_processor
+        self, monkeypatch, mock_model, mock_processor, caplog
     ):
         """A peer prefetched while singleton MTP starts must join as AR."""
         monkeypatch.setenv("MLX_VLM_MTP_REPROMOTE", "1")
+        caplog.set_level(logging.INFO, logger="mlx_vlm.generate")
         model = mock_model.language_model
         draft = SimpleNamespace(unload=MagicMock())
         cache_factory = object()
@@ -1723,6 +1724,7 @@ class TestBatchGenerator:
         assert gen._generation_batch.uids == [100, 200]
         assert gen._generation_batch._mtp_repromotion["draft_model"] is draft
         draft.unload.assert_called_once_with()
+        assert "Demoted active MTP cohort to AR before cold peer admission" in caplog.text
         gen.close()
 
     def test_paged_runtime_accepts_only_singleton_mtp(
