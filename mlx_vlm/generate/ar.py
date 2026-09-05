@@ -3116,6 +3116,7 @@ class BatchGenerator:
         draft_block_size: Optional[int] = None,
         greedy_sampling: bool = False,
         paged_cache_factory=None,
+        owns_paged_cache_factory: bool = True,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -3155,6 +3156,7 @@ class BatchGenerator:
             ):
                 raise ValueError("paged TurboQuant runtime requires Q4 TurboQuant KV")
         self._paged_cache_factory = paged_cache_factory
+        self._owns_paged_cache_factory = bool(owns_paged_cache_factory)
         if self.draft_model is not None:
             compute_logprobs = False
             top_logprobs_k = 0
@@ -3655,7 +3657,9 @@ class BatchGenerator:
             _release_cache_resources(getattr(generation_batch, "prompt_cache", []))
         paged_factory = getattr(self, "_paged_cache_factory", None)
         release_factory = getattr(paged_factory, "release", None)
-        if callable(release_factory):
+        if callable(release_factory) and getattr(
+            self, "_owns_paged_cache_factory", True
+        ):
             final_stats = release_factory()
             logger.info(
                 "Paged TurboQuant pool closed: used_pages=%s "

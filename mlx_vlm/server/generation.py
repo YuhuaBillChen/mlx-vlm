@@ -1213,6 +1213,10 @@ class ResponseGenerator:
         self._stop = False
         self._ready = Event()
         self._load_error: Optional[Exception] = None
+        # Paged storage is a server resource. Request cohorts borrow facades
+        # from it and return their pages, while the backing arrays stay alive
+        # across idle gaps and sequential requests.
+        self._paged_registry = None
         self._cancelled: set = set()
         self._cancel_lock = Lock()
         self._tokenizer_lock = Lock()
@@ -2107,6 +2111,20 @@ class ResponseGenerator:
         try:
             self._run_impl()
         finally:
+            paged_registry = getattr(self, "_paged_registry", None)
+            release_registry = getattr(paged_registry, "release", None)
+            if callable(release_registry):
+                final_stats = release_registry()
+                logger.info(
+                    "Persistent Paged TurboQuant pool closed at server shutdown: "
+                    "used_pages=%s high_water_pages=%s capacity_pages=%s "
+                    "pool_bytes=%s",
+                    getattr(final_stats, "used_layer_pages", None),
+                    getattr(final_stats, "high_water_layer_pages", None),
+                    getattr(final_stats, "capacity_layer_pages", None),
+                    getattr(final_stats, "pool_nbytes", None),
+                )
+                self._paged_registry = None
             clear_mlx_streams()
 
     def _run_impl(self):
@@ -2271,25 +2289,40 @@ class ResponseGenerator:
                         request, backend="continuous_batching"
                     )
                     if batch_gen is None:
-                        paged_registry = None
+                        paged_registry = getattr(self, "_paged_registry", None)
                         if paged_turboquant_enabled():
-                            paged_registry = make_paged_turboquant_registry(
-                                self.model.language_model
-                            )
-                            logger.info(
-                                "Paged TurboQuant enabled: capacity_tokens=%d "
-                                "pageable_layers=%d max_num_seqs=%d; APC=%s; "
-                                "singleton-only MTP=%s",
-                                get_paged_kv_capacity_tokens(),
-                                len(paged_registry.leaf_keys),
-                                get_max_num_seqs(),
-                                self.apc_manager is not None,
-                                bool(
-                                    self.draft_model is not None
-                                    and self.draft_kind == "mtp"
-                                    and speculative_singleton_only()
-                                ),
-                            )
+                            if paged_registry is None:
+                                paged_registry = make_paged_turboquant_registry(
+                                    self.model.language_model
+                                )
+                                self._paged_registry = paged_registry
+                                logger.info(
+                                    "Paged TurboQuant enabled: capacity_tokens=%d "
+                                    "pageable_layers=%d max_num_seqs=%d; APC=%s; "
+                                    "singleton-only MTP=%s",
+                                    get_paged_kv_capacity_tokens(),
+                                    len(paged_registry.leaf_keys),
+                                    get_max_num_seqs(),
+                                    self.apc_manager is not None,
+                                    bool(
+                                        self.draft_model is not None
+                                        and self.draft_kind == "mtp"
+                                        and speculative_singleton_only()
+                                    ),
+                                )
+                            else:
+                                pool_stats = paged_registry.stats()
+                                if pool_stats.used_layer_pages:
+                                    raise RuntimeError(
+                                        "Cannot reuse a paged TurboQuant pool with "
+                                        f"{pool_stats.used_layer_pages} live pages."
+                                    )
+                                logger.info(
+                                    "Reusing persistent Paged TurboQuant pool: "
+                                    "capacity_tokens=%d high_water_pages=%d",
+                                    get_paged_kv_capacity_tokens(),
+                                    pool_stats.high_water_layer_pages,
+                                )
                         batch_gen = BatchGenerator(
                             self.model.language_model,
                             self.processor,
@@ -2323,6 +2356,7 @@ class ResponseGenerator:
                                 else DEFAULT_COMPLETION_BATCH_SIZE
                             ),
                             paged_cache_factory=paged_registry,
+                            owns_paged_cache_factory=False,
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization

@@ -1727,6 +1727,21 @@ class TestBatchGenerator:
         assert "Demoted active MTP cohort to AR before cold peer admission" in caplog.text
         gen.close()
 
+    def test_close_returns_rows_without_releasing_server_owned_paged_pool(self):
+        """A completed cohort must leave persistent pool ownership to the server."""
+        registry = SimpleNamespace(release=MagicMock())
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen._prompt_batch = None
+        gen._generation_batch = None
+        gen._paged_cache_factory = registry
+        gen._owns_paged_cache_factory = False
+        gen._wire_stack = None
+
+        gen.close()
+
+        registry.release.assert_not_called()
+        assert gen._paged_cache_factory is registry
+
     def test_paged_runtime_accepts_only_singleton_mtp(
         self, monkeypatch, mock_model, mock_processor
     ):

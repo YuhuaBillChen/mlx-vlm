@@ -72,6 +72,29 @@ def test_response_generator_clears_worker_streams(monkeypatch):
     clear_streams.assert_called_once_with()
 
 
+def test_response_generator_releases_persistent_paged_pool_at_worker_shutdown(
+    monkeypatch,
+):
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    final_stats = SimpleNamespace(
+        used_layer_pages=0,
+        high_water_layer_pages=12,
+        capacity_layer_pages=64,
+        pool_nbytes=1024,
+    )
+    registry = SimpleNamespace(release=MagicMock(return_value=final_stats))
+    gen._paged_registry = registry
+    gen._run_impl = MagicMock()
+    clear_streams = MagicMock()
+    monkeypatch.setattr(server_generation, "clear_mlx_streams", clear_streams)
+
+    gen._run()
+
+    registry.release.assert_called_once_with()
+    assert gen._paged_registry is None
+    clear_streams.assert_called_once_with()
+
+
 _MUSE_RESPONSE_TEMPLATE = {
     "defaults": {"role": "assistant"},
     "fields": {
