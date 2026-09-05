@@ -2107,6 +2107,23 @@ class ResponseGenerator:
 
         return admitted, deferred
 
+    def _can_repromote_singleton_mtp(self, active, batch_gen, admitted) -> bool:
+        """Return whether the surviving AR lane can resume singleton MTP.
+
+        Deferred requests may remain in ``self.requests`` solely because their
+        reserved KV budgets do not fit beside the active lane.  Their presence
+        must not suppress MTP until the active lane finishes; only a request
+        admitted in this iteration or a prompt already pending in the batch
+        needs to keep the cohort in AR mode.
+        """
+        return (
+            len(active) == 1
+            and mtp_repromotion_enabled()
+            and speculative_singleton_only()
+            and not batch_gen.has_pending_prompts
+            and not admitted
+        )
+
     def _run(self):
         try:
             self._run_impl()
@@ -2448,13 +2465,7 @@ class ResponseGenerator:
                             pool_stats.capacity_layer_pages,
                         )
                     last_paged_active_count = len(active)
-                if (
-                    len(active) == 1
-                    and mtp_repromotion_enabled()
-                    and speculative_singleton_only()
-                    and not batch_gen.has_pending_prompts
-                    and self.requests.empty()
-                ):
+                if self._can_repromote_singleton_mtp(active, batch_gen, new_items):
                     # A completed peer can leave B>1 attention temporaries in
                     # MLX's allocator cache. Drop those before reloading the
                     # singleton MTP drafter or their footprints overlap.

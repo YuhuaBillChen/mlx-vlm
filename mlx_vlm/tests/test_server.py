@@ -1123,6 +1123,24 @@ def test_paged_scheduler_stops_bypassing_aged_request(monkeypatch):
     assert long_request.kv_bypass_count == 1
 
 
+def test_deferred_kv_request_does_not_block_singleton_mtp_repromotion(
+    monkeypatch,
+):
+    monkeypatch.setenv("MLX_VLM_MTP_REPROMOTE", "1")
+    monkeypatch.setenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "1")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.requests = Queue()
+    gen.requests.put(object())  # Deferred because its KV reservation cannot fit.
+    batch_gen = SimpleNamespace(has_pending_prompts=False)
+
+    assert gen._can_repromote_singleton_mtp(
+        active={1: {}}, batch_gen=batch_gen, admitted=[]
+    )
+    assert not gen._can_repromote_singleton_mtp(
+        active={1: {}}, batch_gen=batch_gen, admitted=[object()]
+    )
+
+
 def test_paged_scheduler_respects_active_lane_capacity(monkeypatch):
     monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
     monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "4096")
