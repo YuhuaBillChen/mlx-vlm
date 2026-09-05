@@ -1683,7 +1683,7 @@ class TestBatchGenerator:
         """A peer prefetched while singleton MTP starts must join as AR."""
         monkeypatch.setenv("MLX_VLM_MTP_REPROMOTE", "1")
         model = mock_model.language_model
-        draft = object()
+        draft = SimpleNamespace(unload=MagicMock())
         cache_factory = object()
         sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
         stop = lambda token: False
@@ -1722,6 +1722,7 @@ class TestBatchGenerator:
         assert isinstance(gen._generation_batch, GenerationBatch)
         assert gen._generation_batch.uids == [100, 200]
         assert gen._generation_batch._mtp_repromotion["draft_model"] is draft
+        draft.unload.assert_called_once_with()
         gen.close()
 
     def test_paged_runtime_accepts_only_singleton_mtp(
@@ -1911,6 +1912,30 @@ class TestBatchGenerator:
                 greedy_sampling=True,
             )
 
+        def make_ar_batch(uid, prompt, max_tokens=12):
+            prompt = mx.array([prompt], dtype=mx.int32)
+            prompt_cache = ar_module._make_cache(
+                target,
+                [0],
+                kv_bits=4,
+                kv_quant_scheme="turboquant",
+            )
+            output = target(prompt, cache=prompt_cache)
+            first = mx.argmax(output.logits[:, -1, :], axis=-1)
+            mx.eval(first, [c.state for c in prompt_cache])
+            batch = GenerationBatch(
+                model=target,
+                uids=[uid],
+                inputs=first,
+                prompt_cache=prompt_cache,
+                sampler=sampler,
+                stop_criteria=lambda token: False,
+                max_tokens=[max_tokens],
+                greedy_sampling=True,
+            )
+            batch.compute_logprobs = False
+            return batch
+
         def drain(batch):
             tokens = {}
             while len(batch) > 0:
@@ -1933,6 +1958,36 @@ class TestBatchGenerator:
 
         assert dynamic[100] == baseline_a
         assert dynamic[200] == baseline_b
+
+        # Reproduce the synchronized-cold admission lifecycle: A begins in
+        # singleton MTP, B finishes prefill as AR, A demotes for the join, and
+        # the surviving A row later re-promotes. Both token streams must match
+        # their uninterrupted singleton trajectories exactly.
+        transitioning = make_batch(210, [1, 2, 3, 4], max_tokens=12)
+        transitioned_tokens = {210: []}
+        for _ in range(2):
+            for response in transitioning.next():
+                transitioned_tokens[210].append(response.token)
+        transitioning_ar = transitioning.to_autoregressive()
+        transitioning_ar.enable_mtp_repromotion(draft, draft_block_size=3)
+        transitioning_ar.extend(make_ar_batch(220, [5, 6, 7, 8, 9], max_tokens=3))
+        while 220 in transitioning_ar.uids:
+            for response in transitioning_ar.next():
+                if response.token is not None:
+                    transitioned_tokens.setdefault(response.uid, []).append(
+                        response.token
+                    )
+        promoted = transitioning_ar.to_speculative_mtp()
+        assert promoted is not None
+        for uid, tokens in drain(promoted).items():
+            transitioned_tokens.setdefault(uid, []).extend(tokens)
+
+        assert transitioned_tokens[210] == drain(
+            make_batch(210, [1, 2, 3, 4], 12)
+        )[210]
+        assert transitioned_tokens[220] == drain(
+            make_ar_batch(220, [5, 6, 7, 8, 9], 3)
+        )[220]
 
         # A short row must be removed from the target/drafter cache before a
         # later request joins the still-active row.

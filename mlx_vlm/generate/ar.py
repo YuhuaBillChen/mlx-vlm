@@ -3234,6 +3234,12 @@ class BatchGenerator:
                 current._draft_owner,
                 draft_block_size=current.draft_block_size,
             )
+        # The stable owner is a LazyDrafter in the phase-swap runtime. Release
+        # its materialized weights as soon as the cohort switches to AR; the
+        # same owner can materialize them again when a singleton re-promotes.
+        unload = getattr(current._draft_owner, "unload", None)
+        if callable(unload):
+            unload()
         self._generation_batch = batch
         return True
 

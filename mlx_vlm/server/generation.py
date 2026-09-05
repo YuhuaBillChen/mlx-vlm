@@ -2215,7 +2215,6 @@ class ResponseGenerator:
                     and speculative_singleton_only()
                     and batch_gen.demote_mtp_to_ar()
                 ):
-                    self._unload_deferred_drafter()
                     gc.collect()
                     mx.clear_cache()
                     logger.info(
