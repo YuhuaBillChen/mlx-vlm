@@ -3798,6 +3798,18 @@ class BatchGenerator:
         if len(self._generation_batch) == 0:
             self._generation_batch = gen_batch
         else:
+            # With singleton-only speculation, a peer can begin cold prefill
+            # while the first request is already decoding with MTP.  The peer
+            # is intentionally prefetched as AR, so demote the active MTP
+            # cohort before joining the two GenerationBatch instances.
+            if isinstance(
+                self._generation_batch, SpeculativeGenerationBatch
+            ) and isinstance(gen_batch, GenerationBatch):
+                if not self.demote_mtp_to_ar():
+                    raise RuntimeError(
+                        "Cannot admit an autoregressive peer into the active "
+                        "speculative generation batch."
+                    )
             self._generation_batch.extend(gen_batch)
 
     def _next(self, **kwargs):

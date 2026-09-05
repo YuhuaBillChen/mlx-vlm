@@ -1677,6 +1677,53 @@ class TestBatchGenerator:
         gen._generation_batch = Active()
         assert gen._draft_for_prompt_batch(1) == (None, None, None)
 
+    def test_cold_peer_demotes_active_singleton_mtp_before_ar_join(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        """A peer prefetched while singleton MTP starts must join as AR."""
+        monkeypatch.setenv("MLX_VLM_MTP_REPROMOTE", "1")
+        model = mock_model.language_model
+        draft = object()
+        cache_factory = object()
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop = lambda token: False
+        gen = BatchGenerator(model=model, processor=mock_processor)
+        active = SpeculativeGenerationBatch(
+            model=model,
+            draft_model=draft,
+            draft_kind="mtp",
+            uids=[100],
+            first_tokens=mx.array([3], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop,
+            max_tokens=[8],
+            hidden=mx.zeros((1, 1, 1)),
+            shared_kv_states=None,
+            prompt_tokens=mx.array([[1, 2]], dtype=mx.int32),
+            greedy_sampling=True,
+            paged_cache_factory=cache_factory,
+        )
+        peer = GenerationBatch(
+            model=model,
+            uids=[200],
+            inputs=mx.array([4], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop,
+            max_tokens=[8],
+            greedy_sampling=True,
+            paged_cache_factory=cache_factory,
+        )
+        gen._generation_batch = active
+
+        gen._extend_generation_batch(peer)
+
+        assert isinstance(gen._generation_batch, GenerationBatch)
+        assert gen._generation_batch.uids == [100, 200]
+        assert gen._generation_batch._mtp_repromotion["draft_model"] is draft
+        gen.close()
+
     def test_paged_runtime_accepts_only_singleton_mtp(
         self, monkeypatch, mock_model, mock_processor
     ):
