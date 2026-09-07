@@ -2670,10 +2670,14 @@ class ResponseGenerator:
         kwargs = gen_kwargs or {}
         prompt_responses, responses = batch_gen.next(**kwargs)
         # A request can wait behind another row's long chunked prefill after it
-        # has already received its GenerationContext.  Keep its inactivity
-        # watchdog alive on real GPU progress without exposing fake tokens.
-        for info in active.values():
-            info["rqueue"].put(_TOKEN_QUEUE_ACTIVITY)
+        # has already received its GenerationContext. Keep only those silent
+        # consumers alive; a real response already resets its inactivity
+        # timeout and must remain the next observable queue item.
+        responding_uids = {response.uid for response in responses}
+        for uid, info in active.items():
+            rqueue = info.get("rqueue")
+            if uid not in responding_uids and rqueue is not None:
+                rqueue.put(_TOKEN_QUEUE_ACTIVITY)
         self._log_prefill_progress(batch_gen, active)
         released_prefill_inputs = False
         for prompt_response in prompt_responses:
