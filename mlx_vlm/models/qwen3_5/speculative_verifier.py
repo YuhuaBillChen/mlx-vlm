@@ -1332,6 +1332,16 @@ def _target_verify_mxfp4_argmax(
         return None
 
     B, T, K = x.shape
+    # The verifier kernels preserve singleton reduction order across their
+    # short T dimension.  Treat a small decode batch as one verifier sequence
+    # so B=2..4 uses exactly the same LM-head reduction geometry as B=1.
+    if T == 1 and 1 < B <= 4:
+        out = _target_verify_mxfp4_argmax(
+            linear, x.transpose(1, 0, 2), token_mask=token_mask
+        )
+        if out is not None:
+            return out.transpose(1, 0)
+
     N = linear.weight.shape[0]
     num_tiles = N // 8
     x = mx.contiguous(x)
@@ -1542,6 +1552,16 @@ def _target_verify_linear(linear, x: mx.array) -> mx.array:
         return linear(x)
 
     if isinstance(linear, nn.QuantizedLinear):
+        # The MXFP4 verifier kernel shares each decoded weight vector across
+        # its short T dimension.  A decode cohort has the complementary shape
+        # [B, 1, K], so present up to four independent rows as [1, B, K].
+        # This changes only the dispatch geometry of a stateless projection;
+        # every output keeps the verifier's singleton reduction order.
+        if 1 < x.shape[0] <= 4 and x.shape[1] == 1:
+            batch_as_time = x.transpose(1, 0, 2)
+            out = _target_verify_mxfp4_linear(linear, batch_as_time)
+            if out is not None:
+                return out.transpose(1, 0, 2)
         out = _target_verify_mxfp4_linear(linear, x)
         if out is not None:
             return out
@@ -1669,6 +1689,12 @@ def _target_verify_linears(linears, x: mx.array):
         if out is not None:
             return out
         return tuple(linear(x) for linear in linears)
+
+    if 1 < x.shape[0] <= 4 and x.shape[1] == 1:
+        batch_as_time = x.transpose(1, 0, 2)
+        out = _target_verify_mxfp4_linears(linears, batch_as_time)
+        if out is not None:
+            return tuple(value.transpose(1, 0, 2) for value in out)
 
     out = _target_verify_mxfp4_linears(linears, x)
     if out is not None:
@@ -1959,22 +1985,23 @@ class Qwen3_5BatchInvariantForward:
             use_kernel=not layer.training,
             state_steps=length - 1,
         )
-        gdn_sink.append(
-            (
-                q,
-                k,
-                v,
-                a,
-                b,
-                layer.A_log,
-                layer.dt_bias,
-                initial_state,
-                mask,
-                conv_input,
-                layer.conv_kernel_size,
-                intermediate_states,
+        if gdn_sink is not None:
+            gdn_sink.append(
+                (
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    layer.A_log,
+                    layer.dt_bias,
+                    initial_state,
+                    mask,
+                    conv_input,
+                    layer.conv_kernel_size,
+                    intermediate_states,
+                )
             )
-        )
 
         if cache is not None:
             cache[1] = state
@@ -2085,12 +2112,13 @@ class Qwen3_5BatchInvariantForward:
         capture_layer_ids: Optional[list[int]] = None,
         return_hidden: bool = False,
         return_shared_kv: bool = False,
+        return_gdn_states: bool = True,
         skip_logits: bool = False,
     ) -> LanguageModelOutput:
         hidden_sink: list[mx.array] | None = (
             [] if capture_layer_ids is not None else None
         )
-        gdn_sink: list = []
+        gdn_sink: Optional[list] = [] if return_gdn_states else None
         hidden = self._model(
             language_model.model,
             inputs,

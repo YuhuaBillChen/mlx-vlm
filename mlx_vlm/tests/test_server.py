@@ -5664,6 +5664,37 @@ class TestResponseGenerator:
 
         assert cancelled == ["req-1"]
 
+    def test_token_iterator_consumes_activity_heartbeat_without_emitting_it(self):
+        cancelled = []
+        token = SimpleNamespace(text="hello")
+        rqueue = Queue()
+        rqueue.put(server_generation._TOKEN_QUEUE_ACTIVITY)
+        rqueue.put(token)
+        token_iter = server_generation._TokenIterator(
+            rqueue,
+            "req-1",
+            cancelled.append,
+            0.01,
+        )
+
+        assert next(token_iter) is token
+        assert cancelled == []
+
+    def test_batch_step_reports_gpu_activity_to_all_active_iterators(self):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        first_queue = Queue()
+        second_queue = Queue()
+        batch_gen = SimpleNamespace(next=lambda **kwargs: ([], []), _prompt_batch=None)
+        active = {
+            1: {"rqueue": first_queue},
+            2: {"rqueue": second_queue},
+        }
+
+        gen._step(batch_gen, active)
+
+        assert first_queue.get_nowait() is server_generation._TOKEN_QUEUE_ACTIVITY
+        assert second_queue.get_nowait() is server_generation._TOKEN_QUEUE_ACTIVITY
+
     def test_token_iterator_close_cancels_while_next_blocks(self):
         cancelled = []
         result = []

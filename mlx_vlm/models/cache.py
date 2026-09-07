@@ -17,6 +17,12 @@ def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
     unquantized — it is sensitive to quantization (see gemma-4-class models).
     Shallow stacks (``num_layers <= 2``) quantize every layer when kv-bits is on.
     """
+    if os.environ.get("MLX_VLM_QUANTIZE_LAST_KV_LAYER", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return True
     if num_layers <= 2:
         return True
     return layer_idx < num_layers - 1

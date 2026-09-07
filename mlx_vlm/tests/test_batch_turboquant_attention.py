@@ -597,6 +597,22 @@ class TestNumericalEquivalence:
         assert mx.allclose(fused_k, reference_k, atol=2e-3).item()
         assert mx.allclose(fused_v, reference_v, atol=2e-3).item()
 
+    def test_batch_invariant_mode_uses_reference_dequantize(self, monkeypatch):
+        cache, keys, values = _filled([0], 300)
+        monkeypatch.setenv("MLX_VLM_TQ_FUSED_DEQUANT", "1")
+        monkeypatch.setenv("MLX_VLM_BATCH_INVARIANT", "1")
+
+        def fail_fused(*args, **kwargs):
+            raise AssertionError("approximate fused dequantize is not invariant")
+
+        monkeypatch.setattr(cache, "_fused_mse_dequantize_pair", fail_fused)
+        reference_k, reference_v = cache.dequantize(keys, values)
+        actual_k, actual_v = cache.dequantize_for_attention(keys, values)
+        mx.eval(reference_k, reference_v, actual_k, actual_v)
+
+        assert bool(mx.array_equal(actual_k, reference_k).item())
+        assert bool(mx.array_equal(actual_v, reference_v).item())
+
     @pytest.mark.skipif(not hasattr(mx, "metal"), reason="requires Metal kernels")
     def test_attention_fallback_uses_fused_dequantize(self, monkeypatch):
         cache, keys, values = _filled([0, 0], 300)

@@ -618,6 +618,68 @@ def test_qwen_gdn_verify_update_matches_stepwise_path():
     assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
 
 
+def test_qwen_gdn_decode_update_is_batch_invariant():
+    mx.random.seed(28)
+    B, S, Hk, D, Hv, Dv = 4, 1, 2, 64, 4, 16
+    q = mx.random.normal((B, S, Hk, D)).astype(mx.bfloat16)
+    k = mx.random.normal((B, S, Hk, D)).astype(mx.bfloat16)
+    v = mx.random.normal((B, S, Hv, Dv)).astype(mx.bfloat16)
+    a = mx.random.normal((B, S, Hv)).astype(mx.bfloat16)
+    b = mx.random.normal((B, S, Hv)).astype(mx.bfloat16)
+    A_log = mx.random.normal((Hv,)).astype(mx.bfloat16)
+    dt_bias = mx.ones((Hv,), dtype=mx.bfloat16)
+    state = mx.random.normal((B, Hv, Dv, D)).astype(mx.float32)
+
+    out, next_state = qwen_language.gated_delta_update(
+        q, k, v, a, b, A_log, dt_bias, state
+    )
+    rowwise = [
+        qwen_language.gated_delta_update(
+            q[row : row + 1],
+            k[row : row + 1],
+            v[row : row + 1],
+            a[row : row + 1],
+            b[row : row + 1],
+            A_log,
+            dt_bias,
+            state[row : row + 1],
+        )
+        for row in range(B)
+    ]
+    ref_out = mx.concatenate([value[0] for value in rowwise], axis=0)
+    ref_state = mx.concatenate([value[1] for value in rowwise], axis=0)
+    mx.eval(out, next_state, ref_out, ref_state)
+
+    assert bool(mx.array_equal(out, ref_out).item())
+    assert bool(mx.array_equal(next_state, ref_state).item())
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_qwen_gdn_decode_with_states_matches_normal_kernel(batch_size):
+    mx.random.seed(29 + batch_size)
+    S, Hk, D, Hv, Dv = 1, 2, 64, 4, 16
+    q = mx.random.normal((batch_size, S, Hk, D)).astype(mx.bfloat16)
+    k = mx.random.normal((batch_size, S, Hk, D)).astype(mx.bfloat16)
+    v = mx.random.normal((batch_size, S, Hv, Dv)).astype(mx.bfloat16)
+    a = mx.random.normal((batch_size, S, Hv)).astype(mx.bfloat16)
+    b = mx.random.normal((batch_size, S, Hv)).astype(mx.bfloat16)
+    A_log = mx.random.normal((Hv,)).astype(mx.bfloat16)
+    dt_bias = mx.ones((Hv,), dtype=mx.bfloat16)
+    state = mx.random.normal((batch_size, Hv, Dv, D)).astype(mx.float32)
+
+    ref_out, ref_state = qwen_language.gated_delta_update(
+        q, k, v, a, b, A_log, dt_bias, state
+    )
+    out, next_state, intermediate = qwen_verifier.gated_delta_update_with_states(
+        q, k, v, a, b, A_log, dt_bias, state, state_steps=0
+    )
+    mx.eval(ref_out, ref_state, out, next_state, intermediate)
+
+    assert intermediate.shape[1] == 0
+    assert bool(mx.array_equal(out, ref_out).item())
+    assert bool(mx.array_equal(next_state, ref_state).item())
+
+
 def test_qwen_gdn_verify_can_omit_the_live_final_state():
     mx.random.seed(27)
     B, S, Hk, D, Hv, Dv = 1, 3, 2, 64, 4, 16
@@ -738,6 +800,39 @@ def test_qwen_target_verify_mxfp4_linear_matches_singleton_path_exactly(
     assert bool(mx.array_equal(ref, public).item())
 
 
+@pytest.mark.parametrize("batch_size", [2, 4])
+def test_qwen_target_verify_mxfp4_linear_batch_as_time_is_exact(
+    batch_size, monkeypatch
+):
+    mx.random.seed(76 + batch_size)
+    linear = nn.QuantizedLinear(
+        512,
+        32,
+        bias=False,
+        group_size=32,
+        bits=4,
+        mode="mxfp4",
+    )
+    x = mx.random.normal((batch_size, 1, 512)).astype(mx.bfloat16)
+
+    ref = mx.concatenate(
+        [linear(x[row : row + 1]) for row in range(batch_size)], axis=0
+    )
+    calls = []
+    original = qwen_verifier._target_verify_mxfp4_linear
+
+    def traced(linear, value):
+        calls.append(value.shape)
+        return original(linear, value)
+
+    monkeypatch.setattr(qwen_verifier, "_target_verify_mxfp4_linear", traced)
+    out = qwen_verifier._target_verify_linear(linear, x)
+    mx.eval(ref, out)
+
+    assert calls == [(1, batch_size, 512)]
+    assert bool(mx.array_equal(ref, out).item())
+
+
 @pytest.mark.parametrize("output_dims", [(16, 24), (16, 24, 32)])
 @pytest.mark.parametrize("verify_length", [2, 4])
 @pytest.mark.parametrize("batch_size", [1, 2])
@@ -763,6 +858,45 @@ def test_qwen_target_verify_mxfp4_linears_fuse_exactly(
     out = qwen_verifier._target_verify_linears(linears, x)
     mx.eval(*ref, *out)
 
+    assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
+@pytest.mark.parametrize("batch_size", [2, 4])
+def test_qwen_target_verify_mxfp4_linears_batch_as_time_fuses_exactly(
+    batch_size, monkeypatch
+):
+    mx.random.seed(84 + batch_size)
+    linears = tuple(
+        nn.QuantizedLinear(
+            512,
+            output_dim,
+            bias=False,
+            group_size=32,
+            bits=4,
+            mode="mxfp4",
+        )
+        for output_dim in (16, 24, 32)
+    )
+    x = mx.random.normal((batch_size, 1, 512)).astype(mx.bfloat16)
+
+    ref = tuple(
+        mx.concatenate(
+            [linear(x[row : row + 1]) for row in range(batch_size)], axis=0
+        )
+        for linear in linears
+    )
+    calls = []
+    original = qwen_verifier._target_verify_mxfp4_linears
+
+    def traced(linears, value):
+        calls.append(value.shape)
+        return original(linears, value)
+
+    monkeypatch.setattr(qwen_verifier, "_target_verify_mxfp4_linears", traced)
+    out = qwen_verifier._target_verify_linears(linears, x)
+    mx.eval(*ref, *out)
+
+    assert calls == [(1, batch_size, 512)]
     assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
 
 
@@ -837,6 +971,45 @@ def test_qwen_target_verify_mxfp4_masked_argmax_matches_singletons(
 
     assert bool(mx.array_equal(ref, out).item())
     assert bool(mx.array_equal(ref, public).item())
+
+
+@pytest.mark.parametrize("batch_size", [2, 4])
+def test_qwen3_5_mxfp4_argmax_batch_as_time_matches_rowwise(
+    batch_size, monkeypatch
+):
+    mx.random.seed(91 + batch_size)
+    linear = nn.QuantizedLinear(
+        512,
+        248,
+        bias=False,
+        group_size=32,
+        bits=4,
+        mode="mxfp4",
+    )
+    x = mx.random.normal((batch_size, 1, 512)).astype(mx.bfloat16)
+
+    ref = mx.concatenate(
+        [
+            qwen_verifier._target_verify_mxfp4_argmax(
+                linear, x[row : row + 1]
+            )
+            for row in range(batch_size)
+        ],
+        axis=0,
+    )
+    calls = []
+    original = qwen_verifier._target_verify_mxfp4_argmax
+
+    def traced(linear, value, token_mask=None):
+        calls.append(value.shape)
+        return original(linear, value, token_mask=token_mask)
+
+    monkeypatch.setattr(qwen_verifier, "_target_verify_mxfp4_argmax", traced)
+    out = qwen_verifier._target_verify_mxfp4_argmax(linear, x)
+    mx.eval(out, ref)
+
+    assert calls == [(batch_size, 1, 512), (1, batch_size, 512)]
+    assert bool(mx.array_equal(out, ref).item())
 
 
 @pytest.mark.parametrize("input_dims", [512, 6144])
@@ -3462,6 +3635,50 @@ def _tiny_qwen3_5_text_config():
             "partial_rotary_factor": 0.25,
         },
     )
+
+
+def test_qwen3_5_batch_invariant_decode_is_opt_in(monkeypatch):
+    model = qwen_language.LanguageModel(_tiny_qwen3_5_text_config())
+
+    monkeypatch.delenv("MLX_VLM_BATCH_INVARIANT", raising=False)
+    assert not model._supports_batch_invariant_decode()
+
+    monkeypatch.setenv("MLX_VLM_BATCH_INVARIANT", "1")
+    assert model._supports_batch_invariant_decode()
+
+
+def test_qwen3_5_batch_invariant_decode_uses_exact_forward(monkeypatch):
+    model = qwen_language.LanguageModel(_tiny_qwen3_5_text_config())
+    expected = object()
+    calls = []
+
+    class Verifier:
+        def __call__(self, language_model, inputs, **kwargs):
+            calls.append((language_model, inputs, kwargs))
+            return expected
+
+    monkeypatch.setattr(qwen_language, "_EXACT_SPECULATIVE_VERIFIER", Verifier())
+    inputs = mx.array([[1], [2]], dtype=mx.int32)
+    cache = [object()]
+
+    actual = model._batch_invariant_decode(inputs, cache=cache)
+
+    assert actual is expected
+    assert calls == [
+        (
+            model,
+            inputs,
+            {
+                "cache": cache,
+                "inputs_embeds": None,
+                "position_ids": None,
+                "return_hidden": True,
+                "return_shared_kv": True,
+                "return_gdn_states": False,
+                "skip_logits": False,
+            },
+        )
+    ]
 
 
 def _tiny_qwen3_5_moe_text_config(num_experts=4, moe_intermediate_size=8):

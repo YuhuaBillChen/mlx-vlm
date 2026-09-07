@@ -1158,6 +1158,58 @@ class TestBatchGenerator:
         assert generation_responses == ["token"]
         assert events == ["decode", "prefill"]
 
+    def test_prefill_schedule_interval_allows_one_mixed_step_per_n_decode_steps(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        monkeypatch.setenv("MLX_VLM_PREFILL_SCHEDULE_INTERVAL", "4")
+        events = []
+
+        class ActiveAR:
+            is_speculative = False
+            logits_processors = []
+
+            def __len__(self):
+                return 1
+
+            def next(self):
+                events.append("decode")
+                return ["token"]
+
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=2,
+        )
+        gen._generation_batch = ActiveAR()
+        gen._prompt_batch = SimpleNamespace(
+            needs_processing=lambda: True,
+            prompt_step=lambda: events.append("prefill"),
+        )
+
+        for _ in range(4):
+            gen.next()
+
+        assert events == ["decode", "decode", "decode", "decode", "prefill"]
+
+    def test_prefill_schedule_interval_does_not_throttle_without_decode(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        monkeypatch.setenv("MLX_VLM_PREFILL_SCHEDULE_INTERVAL", "8")
+        events = []
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=2,
+        )
+        gen._prompt_batch = SimpleNamespace(
+            needs_processing=lambda: True,
+            prompt_step=lambda: events.append("prefill"),
+        )
+
+        gen.next()
+
+        assert events == ["prefill"]
+
     def test_prompt_progress_reports_apc_cached_tokens(self):
         batch = PromptProcessingBatch(
             model=SimpleNamespace(),
@@ -1676,6 +1728,92 @@ class TestBatchGenerator:
 
         gen._generation_batch = Active()
         assert gen._draft_for_prompt_batch(1) == (None, None, None)
+
+    def test_singleton_speculation_policy_uses_ar_while_initial_peers_wait(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        """Paged B4 prefill must not materialize MTP for its first B1 chunk."""
+        monkeypatch.setenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "1")
+        draft = object()
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=4,
+            prefill_batch_size=1,
+            draft_model=draft,
+            draft_kind="mtp",
+            draft_block_size=3,
+        )
+        gen.insert([[1], [2], [3], [4]])
+
+        # The paged scheduler will prefill one row at a time, but the other
+        # three rows are already resident work and require an AR cohort.
+        assert gen._draft_for_prompt_batch(1) == (None, None, None)
+        gen.close()
+
+    def test_initial_ar_cohort_retains_singleton_mtp_repromotion_owner(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        monkeypatch.setenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "1")
+        monkeypatch.setenv("MLX_VLM_MTP_REPROMOTE", "1")
+        draft = object()
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=4,
+            draft_model=draft,
+            draft_kind="mtp",
+            draft_block_size=3,
+        )
+        initial = GenerationBatch.empty(
+            mock_model.language_model,
+            gen.sampler,
+            gen.tokenizer.stopping_criteria,
+            compute_logprobs=False,
+            greedy_sampling=True,
+        )
+
+        gen._extend_generation_batch(initial)
+
+        assert gen._generation_batch._mtp_repromotion == {
+            "draft_model": draft,
+            "draft_block_size": 3,
+        }
+        gen.close()
+
+    def test_batch_invariant_policy_disables_mtp_and_repromotion(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        monkeypatch.setenv("MLX_VLM_BATCH_INVARIANT", "1")
+        monkeypatch.setenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "1")
+        monkeypatch.setenv("MLX_VLM_MTP_REPROMOTE", "1")
+        draft = object()
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=4,
+            draft_model=draft,
+            draft_kind="mtp",
+            draft_block_size=3,
+        )
+
+        assert gen._draft_for_prompt_batch(1) == (None, None, None)
+
+        initial = GenerationBatch.empty(
+            mock_model.language_model,
+            gen.sampler,
+            gen.tokenizer.stopping_criteria,
+            compute_logprobs=False,
+            greedy_sampling=True,
+        )
+        gen._extend_generation_batch(initial)
+
+        assert gen._generation_batch._mtp_repromotion is None
+        promote = MagicMock(return_value=object())
+        monkeypatch.setattr(gen._generation_batch, "to_speculative_mtp", promote)
+        assert not gen.promote_ar_singleton_to_mtp()
+        promote.assert_not_called()
+        gen.close()
 
     def test_cold_peer_demotes_active_singleton_mtp_before_ar_join(
         self, monkeypatch, mock_model, mock_processor, caplog

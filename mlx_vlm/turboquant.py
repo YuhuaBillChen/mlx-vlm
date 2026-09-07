@@ -16,6 +16,16 @@ _POLAR_MAX_LEVELS = 4
 _MTP_VERIFY_MAX_APPEND = 15
 
 
+def _fused_dequantize_enabled() -> bool:
+    """Use the approximate FP16 dequantizer only on the fast path."""
+    batch_invariant = os.environ.get("MLX_VLM_BATCH_INVARIANT", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    return os.environ.get("MLX_VLM_TQ_FUSED_DEQUANT") == "1" and not batch_invariant
+
+
 def _should_eval_cache_append(n_new: int, offset: int) -> bool:
     """Bound prefill graphs without synchronizing each small MTP verify append."""
     lazy_verify = os.environ.get("MLX_VLM_TQ_LAZY_VERIFY_APPEND") == "1"
@@ -6982,7 +6992,7 @@ class TurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
             keys_state, values_state = self._attention_states()
         keys_state = self._unwrap(keys_state)
         values_state = self._unwrap(values_state)
-        if os.environ.get("MLX_VLM_TQ_FUSED_DEQUANT") == "1":
+        if _fused_dequantize_enabled():
             fused = self._fused_mse_dequantize_pair(keys_state, values_state)
             if fused is not None:
                 return fused
@@ -7560,7 +7570,7 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
             values_state = _slice_state(self.values, self._idx)
         keys_state = self._unwrap(keys_state)
         values_state = self._unwrap(values_state)
-        if os.environ.get("MLX_VLM_TQ_FUSED_DEQUANT") == "1":
+        if _fused_dequantize_enabled():
             fused = self._fused_mse_dequantize_pair(keys_state, values_state)
             if fused is not None:
                 return fused

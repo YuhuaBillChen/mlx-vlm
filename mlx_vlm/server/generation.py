@@ -66,6 +66,11 @@ DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
 
+# Internal queue marker: a successful GPU step means the producer is alive even
+# when a queued/chunk-prefilling request cannot emit a token yet.  Consumers
+# swallow this marker and restart their inactivity timeout.
+_TOKEN_QUEUE_ACTIVITY = object()
+
 
 class PromptTooLongError(ValueError):
     """Raised when a request exceeds the configured server context budget."""
@@ -1096,22 +1101,26 @@ class _TokenIterator:
     def __next__(self):
         if self._ended:
             raise StopIteration
-        try:
-            item = self._rqueue.get(timeout=self._queue_timeout)
-        except QueueEmpty as exc:
-            # Consumer is stalled or upstream is wedged — treat as cancel.
-            self.close()
-            label = (
-                "without a timeout"
-                if self._queue_timeout is None
-                else f"for {self._queue_timeout:g}s"
-            )
-            raise RuntimeError(
-                "Timed out waiting "
-                f"{label} for the next generated token. "
-                "Increase MLX_VLM_TOKEN_QUEUE_TIMEOUT for long "
-                "prefills, or reduce the prompt size."
-            ) from exc
+        while True:
+            try:
+                item = self._rqueue.get(timeout=self._queue_timeout)
+            except QueueEmpty as exc:
+                # Consumer is stalled or upstream is wedged — treat as cancel.
+                self.close()
+                label = (
+                    "without a timeout"
+                    if self._queue_timeout is None
+                    else f"for {self._queue_timeout:g}s"
+                )
+                raise RuntimeError(
+                    "Timed out waiting "
+                    f"{label} for the next generated token or GPU activity. "
+                    "Increase MLX_VLM_TOKEN_QUEUE_TIMEOUT for unusually slow "
+                    "steps."
+                ) from exc
+            if item is _TOKEN_QUEUE_ACTIVITY:
+                continue
+            break
         if item is None:
             self._ended = True
             raise StopIteration
@@ -2660,6 +2669,11 @@ class ResponseGenerator:
         """One batch generation step: prefill + decode."""
         kwargs = gen_kwargs or {}
         prompt_responses, responses = batch_gen.next(**kwargs)
+        # A request can wait behind another row's long chunked prefill after it
+        # has already received its GenerationContext.  Keep its inactivity
+        # watchdog alive on real GPU progress without exposing fake tokens.
+        for info in active.values():
+            info["rqueue"].put(_TOKEN_QUEUE_ACTIVITY)
         self._log_prefill_progress(batch_gen, active)
         released_prefill_inputs = False
         for prompt_response in prompt_responses:

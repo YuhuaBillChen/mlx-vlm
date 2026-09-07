@@ -59,6 +59,15 @@ logger = logging.getLogger("mlx_vlm.generate")
 
 DEFAULT_TOP_N_SIGMA = 0.0
 DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
+DEFAULT_PREFILL_SCHEDULE_INTERVAL = 1
+
+
+def _batch_invariant_enabled() -> bool:
+    return os.environ.get("MLX_VLM_BATCH_INVARIANT", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 def _cache_leaves(prompt_cache):
@@ -224,6 +233,17 @@ def _get_batch_cache_eval_interval() -> int:
     except ValueError:
         logger.warning("Ignoring invalid MLX_VLM_BATCH_CACHE_EVAL_INTERVAL=%r", raw)
         return DEFAULT_BATCH_CACHE_EVAL_INTERVAL
+
+
+def _get_prefill_schedule_interval() -> int:
+    raw = os.environ.get("MLX_VLM_PREFILL_SCHEDULE_INTERVAL")
+    if raw is None:
+        return DEFAULT_PREFILL_SCHEDULE_INTERVAL
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning("Ignoring invalid MLX_VLM_PREFILL_SCHEDULE_INTERVAL=%r", raw)
+        return DEFAULT_PREFILL_SCHEDULE_INTERVAL
 
 
 def _position_seed(seed: int, row_id: int, position: int) -> int:
@@ -3200,17 +3220,32 @@ class BatchGenerator:
         self._gen_tokens_counter = 0
         self._steps_counter = 0
         self._cache_eval_interval = _get_batch_cache_eval_interval()
+        self._prefill_schedule_interval = _get_prefill_schedule_interval()
+        self._decode_prefill_cadence_step = 0
+        if self._prefill_schedule_interval > 1:
+            logger.info(
+                "Prefill cadence enabled: one mixed prefill step per %d "
+                "active decode steps.",
+                self._prefill_schedule_interval,
+            )
 
         self._wire_stack = contextlib.ExitStack()
         self._wire_stack.enter_context(wired_limit(model, [self._stream]))
 
     def _draft_for_prompt_batch(self, batch_size: int):
+        # Batch-invariant mode compares the same AR execution across cohort
+        # sizes. Singleton MTP is a different decoding algorithm and would
+        # make a B1 request change trajectory as soon as a peer is admitted.
+        if _batch_invariant_enabled():
+            return None, None, None
         singleton_only = os.environ.get(
             "MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "0"
         ).lower() in ("1", "true", "yes")
         generation_batch = getattr(self, "_generation_batch", ())
         if singleton_only and (
-            batch_size != 1 or len(generation_batch) > 0
+            batch_size != 1
+            or len(generation_batch) > 0
+            or bool(getattr(self, "_unprocessed_sequences", ()))
         ):
             return None, None, None
         return (
@@ -3247,6 +3282,8 @@ class BatchGenerator:
 
     def promote_ar_singleton_to_mtp(self) -> bool:
         """Resume singleton MTP after its admitted AR peers have departed."""
+        if _batch_invariant_enabled():
+            return False
         current = self._generation_batch
         if not isinstance(current, GenerationBatch):
             return False
@@ -3824,6 +3861,24 @@ class BatchGenerator:
                     "Demoted active MTP cohort to AR before cold peer admission."
                 )
             self._generation_batch.extend(gen_batch)
+        if (
+            isinstance(self._generation_batch, GenerationBatch)
+            and self._generation_batch._mtp_repromotion is None
+            and self.draft_model is not None
+            and self.draft_kind == "mtp"
+            and os.environ.get("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "0").lower()
+            in ("1", "true", "yes")
+            and os.environ.get("MLX_VLM_MTP_REPROMOTE", "0").lower()
+            in ("1", "true", "yes")
+            and not _batch_invariant_enabled()
+        ):
+            # An initial multi-request cohort starts in AR because paged
+            # prefill is intentionally B1. Preserve the lazy drafter owner so
+            # the final surviving row can switch to MTP without KV migration.
+            self._generation_batch.enable_mtp_repromotion(
+                self.draft_model,
+                draft_block_size=self.draft_block_size,
+            )
 
     def _next(self, **kwargs):
         generation_responses = []
@@ -3839,6 +3894,10 @@ class BatchGenerator:
             generation_responses = self._generation_batch.next()
             self._gen_tokens_counter += len(generation_responses)
             self._steps_counter += 1
+            if len(self._generation_batch) > 0:
+                self._decode_prefill_cadence_step += 1
+            else:
+                self._decode_prefill_cadence_step = 0
             if (
                 self._cache_eval_interval > 0
                 and self._steps_counter % self._cache_eval_interval == 0
@@ -3855,6 +3914,8 @@ class BatchGenerator:
                 mx.clear_cache()
             if yield_after_decode:
                 return prompt_responses, generation_responses
+        else:
+            self._decode_prefill_cadence_step = 0
 
         if (
             getattr(self._generation_batch, "is_speculative", False)
@@ -3864,6 +3925,18 @@ class BatchGenerator:
             return prompt_responses, generation_responses
 
         if len(self._generation_batch) >= self.completion_batch_size:
+            return prompt_responses, generation_responses
+
+        # Decode latency takes priority while a cold/warm prompt is waiting.
+        # N=1 preserves the original behavior. For N>1, exactly one out of
+        # every N active decode forwards may also advance one prefill chunk.
+        if (
+            len(self._generation_batch) > 0
+            and self._prefill_schedule_interval > 1
+            and self._decode_prefill_cadence_step
+            % self._prefill_schedule_interval
+            != 0
+        ):
             return prompt_responses, generation_responses
 
         if self._prompt_batch is not None:
