@@ -115,6 +115,33 @@ def speculative_hidden_state(draft_kind: str, outputs):
     )
 
 
+class SpeculativePrefill:
+    """Retain the target features needed by a drafter across prompt chunks."""
+
+    def __init__(self, draft_kind, drafter):
+        self.kwargs = (
+            speculative_prefill_kwargs(draft_kind, drafter)
+            if drafter is not None and draft_kind in ("dflash", "eagle3")
+            else {}
+        )
+        self.chunks = []
+
+    def append(self, output):
+        if self.kwargs:
+            hidden = output.hidden_states
+            mx.async_eval(hidden)
+            self.chunks.append(hidden)
+
+    def finish(self, output):
+        if self.chunks:
+            self.chunks.append(output.hidden_states)
+            output.hidden_states = [
+                mx.concatenate(parts, axis=1) for parts in zip(*self.chunks)
+            ]
+            self.chunks.clear()
+        return output
+
+
 def make_speculative_prompt_cache(
     lm,
     *,
@@ -148,6 +175,11 @@ def run_speculative_server_rounds(
     eos_token_ids: Optional[set] = None,
     prompt_tokens: Optional[mx.array] = None,
     row_ids: Optional[List[int]] = None,
+    initial_emitted: Optional[List[int]] = None,
+    max_tokens_per_row: Optional[List[int]] = None,
+    paged_cache_factory=None,
+    token_observer: Optional[Callable[[int, int], bool]] = None,
+    forced_token_provider: Optional[Callable[[int], Optional[int]]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
     _validate_speculative_sampling(draft_model, greedy_sampling)
@@ -196,6 +228,7 @@ def run_speculative_server_rounds(
             prompt_cache,
             hidden,
             shared_kv_states,
+            prompt_tokens=prompt_tokens,
             first_bonus=first_bonus,
             max_tokens=max_tokens,
             sampler=sampler,
@@ -205,6 +238,11 @@ def run_speculative_server_rounds(
             eos_token_ids=eos_token_ids,
             greedy_sampling=greedy_sampling,
             row_ids=row_ids,
+            initial_emitted=initial_emitted,
+            max_tokens_per_row=max_tokens_per_row,
+            paged_cache_factory=paged_cache_factory,
+            token_observer=token_observer,
+            forced_token_provider=forced_token_provider,
         )
         return
 
@@ -307,6 +345,7 @@ def run_speculative_rounds(
                 prompt_cache,
                 hidden,
                 shared_kv_states,
+                prompt_tokens=input_ids,
                 first_bonus=first_bonus,
                 max_tokens=max_tokens,
                 sampler=sampler,

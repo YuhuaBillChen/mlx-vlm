@@ -214,11 +214,6 @@ class TestMakeMask:
 class TestPrepareFinalize:
     """Multi-row right-pad lifecycle parity with BatchKVCache (#1567 / #1562)."""
 
-    def test_prepare_finalize_methods_exist(self):
-        cache = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
-        assert callable(getattr(cache, "prepare", None))
-        assert callable(getattr(cache, "finalize", None))
-
     def test_prepare_stores_right_padding(self):
         cache = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
         cache.prepare(right_padding=[3, 0])
@@ -273,6 +268,15 @@ class TestShouldQuantizeKvLayerPolicy:
     def test_deep_stack_boundary(self):
         assert should_quantize_kv_layer(26, 28) is True
         assert should_quantize_kv_layer(27, 28) is False
+
+    def test_explicit_last_layer_quantization(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_QUANTIZE_LAST_KV_LAYER", "1")
+        assert [should_quantize_kv_layer(i, 4) for i in range(4)] == [
+            True,
+            True,
+            True,
+            True,
+        ]
 
 
 class TestMakeCache:

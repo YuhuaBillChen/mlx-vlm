@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
 from threading import Event, Lock, Thread
@@ -34,7 +35,11 @@ from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server.runtime_config import RuntimeConfig
+from mlx_vlm.server.language_lifecycle import ComponentResidencyManager
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
+from mlx_vlm.tools import _infer_tool_parser
+from mlx_vlm.tools.parsers import minicpm5
+from mlx_vlm.utils import StoppingCriteria
 
 
 def test_response_generator_prefill_step_override_wins_over_environment(monkeypatch):
@@ -70,6 +75,183 @@ def test_response_generator_clears_worker_streams(monkeypatch):
 
     gen._run_impl.assert_called_once_with()
     clear_streams.assert_called_once_with()
+
+
+def test_response_generator_releases_persistent_paged_pool_at_worker_shutdown(
+    monkeypatch,
+):
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    final_stats = SimpleNamespace(
+        used_layer_pages=0,
+        high_water_layer_pages=12,
+        capacity_layer_pages=64,
+        pool_nbytes=1024,
+    )
+    registry = SimpleNamespace(release=MagicMock(return_value=final_stats))
+    gen._paged_registry = registry
+    gen._run_impl = MagicMock()
+    clear_streams = MagicMock()
+    monkeypatch.setattr(server_generation, "clear_mlx_streams", clear_streams)
+
+    gen._run()
+
+    registry.release.assert_called_once_with()
+    assert gen._paged_registry is None
+    clear_streams.assert_called_once_with()
+
+
+def test_component_residency_waits_for_last_owner_before_unload():
+    component = SimpleNamespace(load=MagicMock(), unload=MagicMock())
+    residency = ComponentResidencyManager()
+    residency.register("lm_head", component)
+
+    residency.acquire("lm_head", "decode")
+    residency.acquire("lm_head", "final_prefill")
+
+    assert residency.owners("lm_head") == frozenset(
+        {"decode", "final_prefill"}
+    )
+    assert residency.unload_if_idle("lm_head") is False
+    assert residency.release("lm_head", "final_prefill") is False
+    component.unload.assert_not_called()
+    assert residency.release("lm_head", "decode") is True
+    component.unload.assert_called_once_with()
+    assert residency.release("lm_head", "decode") is False
+    component.unload.assert_called_once_with()
+
+
+def test_lm_head_phase_admission_defers_unqualified_mixed_prefill(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(
+        contains=lambda name: name == "lm_head"
+    )
+    first_long = SimpleNamespace(prompt_tokens=98304)
+    short_peer = SimpleNamespace(prompt_tokens=8192)
+    second_long = SimpleNamespace(prompt_tokens=98304)
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [first_long, short_peer, second_long], active={}
+    )
+
+    assert admitted == [first_long, short_peer]
+    assert deferred == [second_long]
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [short_peer, second_long], active={1: {}}
+    )
+
+    assert admitted == [short_peer]
+    assert deferred == [second_long]
+
+
+def test_lm_head_phase_admission_is_unchanged_without_swapped_head():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(contains=lambda _name: False)
+    requests = [SimpleNamespace(prompt_tokens=98304) for _ in range(2)]
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        requests, active={1: {}}
+    )
+
+    assert admitted == requests
+    assert deferred == []
+
+
+def test_lm_head_phase_admission_uses_exact_apc_suffix(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
+    manager = SimpleNamespace(peek_exact_prefix_length=MagicMock(return_value=96000))
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(
+        contains=lambda name: name == "lm_head"
+    )
+    gen.apc_manager = manager
+    gen.apc_mode = "exact"
+    warm_peer = SimpleNamespace(
+        prompt_tokens=98304,
+        raw_inputs={"input_ids": list(range(98304))},
+        apc_semantic_hash=17,
+        request_id="warm-peer",
+        images=None,
+        audio=None,
+        videos=None,
+        apc_prefix_tokens_hint=None,
+        apc_prefix_probe_done=False,
+    )
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [warm_peer], active={1: {}}
+    )
+
+    assert admitted == [warm_peer]
+    assert deferred == []
+    assert warm_peer.apc_prefix_tokens_hint == 96000
+    manager.peek_exact_prefix_length.assert_called_once_with(
+        list(range(98304)), extra_hash=17
+    )
+
+    # Reconsidering the same queued request does not rescan the SSD index on
+    # every scheduler turn.
+    gen._partition_lm_head_phase_admission([warm_peer], active={1: {}})
+    manager.peek_exact_prefix_length.assert_called_once()
+
+
+def test_lm_head_phase_admission_keeps_large_apc_suffix_deferred(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(
+        contains=lambda name: name == "lm_head"
+    )
+    gen.apc_manager = SimpleNamespace(
+        peek_exact_prefix_length=MagicMock(return_value=65536)
+    )
+    gen.apc_mode = "exact"
+    warm_peer = SimpleNamespace(
+        prompt_tokens=98304,
+        raw_inputs={"input_ids": list(range(98304))},
+        apc_semantic_hash=0,
+        request_id="warm-peer-large-suffix",
+        images=None,
+        audio=None,
+        videos=None,
+        apc_prefix_tokens_hint=None,
+        apc_prefix_probe_done=False,
+        kv_bypass_count=0,
+    )
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [warm_peer], active={1: {}}
+    )
+
+    assert admitted == []
+    assert deferred == [warm_peer]
+
+
+def test_lm_head_phase_admission_bounds_short_request_bypass(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS", "1")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(
+        contains=lambda name: name == "lm_head"
+    )
+    long_peer = SimpleNamespace(prompt_tokens=16384, kv_bypass_count=0)
+    short_peer = SimpleNamespace(prompt_tokens=8192, kv_bypass_count=0)
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [long_peer, short_peer], active={1: {}}
+    )
+
+    assert admitted == [short_peer]
+    assert deferred == [long_peer]
+    assert long_peer.kv_bypass_count == 1
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [long_peer, short_peer], active={1: {}}
+    )
+
+    assert admitted == []
+    assert deferred == [long_peer, short_peer]
+    assert long_peer.kv_bypass_count == 1
 
 
 _MUSE_RESPONSE_TEMPLATE = {
@@ -285,6 +467,59 @@ def test_chat_completions_tool_choice_none_disables_tools(client, monkeypatch):
     assert response.json()["choices"][0]["message"]["tool_calls"] is None
     assert mock_template.call_args.kwargs["tools"] is None
     assert mock_template.call_args.kwargs["tool_choice"] == "none"
+
+
+def test_chat_completions_tool_parser_override(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    # A template with no tool markers: inference alone selects no parser.
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(chat_template="a plain template, no tool markers")
+    )
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(
+        text='<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>',
+        prompt_tokens=5,
+        generation_tokens=3,
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        }
+    ]
+
+    def post(extra):
+        with (
+            patch.object(
+                server, "get_cached_model", return_value=(model, processor, config)
+            ),
+            patch.object(server, "apply_chat_template", return_value="prompt"),
+            patch.object(server, "generate", return_value=result),
+        ):
+            return client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "demo",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": tools,
+                    **extra,
+                },
+            )
+
+    # Without an override the markerless template routes to no parser: no calls.
+    base = post({})
+    assert base.status_code == 200
+    assert base.json()["choices"][0]["message"]["tool_calls"] is None
+
+    # The override forces json_tools, which parses the emitted call.
+    overridden = post({"tool_parser": "json_tools"})
+    assert overridden.status_code == 200
+    calls = overridden.json()["choices"][0]["message"]["tool_calls"]
+    assert calls and calls[0]["function"]["name"] == "get_weather"
+
+    # An unknown parser name is rejected at request validation.
+    assert post({"tool_parser": "bogus"}).status_code == 422
 
 
 def test_chat_completions_required_tool_choice_adds_instruction(client, monkeypatch):
@@ -583,6 +818,14 @@ def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
     assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
 
 
+def test_speculative_singleton_only_env(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", raising=False)
+    assert not server_generation.speculative_singleton_only()
+
+    monkeypatch.setenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "1")
+    assert server_generation.speculative_singleton_only()
+
+
 def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     class FakeResponseGenerator:
         def __init__(self, model_path, adapter_path=None, **kwargs):
@@ -773,6 +1016,38 @@ def _unstarted_response_generator():
     return gen
 
 
+def test_server_allows_thinking_budget_for_mtp_only():
+    queued = []
+    criteria = object()
+    gen = _unstarted_response_generator()
+    gen._ready.set()
+    gen.draft_model = object()
+    gen.draft_kind = "mtp"
+    gen._preprocess_request = MagicMock(
+        return_value={"input_ids": mx.array([[1]], dtype=mx.int32)}
+    )
+    gen._make_thinking_budget_criteria = MagicMock(return_value=criteria)
+
+    class InlineQueue:
+        def put(self, request):
+            queued.append(request)
+            request.rqueue.put(server.GenerationContext(uid=7, prompt_tokens=1))
+
+    gen.requests = InlineQueue()
+    args = server.GenerationArguments(max_tokens=8, thinking_budget=4)
+
+    context, _ = gen.generate("prompt", args=args)
+
+    assert context.uid == 7
+    assert queued[0].thinking_budget_criteria is criteria
+
+    gen.draft_kind = "dflash"
+    with pytest.raises(
+        ValueError, match="only supported with MTP speculative decoding"
+    ):
+        gen.generate("prompt", args=args)
+
+
 def test_server_defers_compatible_mtp_drafter_until_decode(monkeypatch):
     target_config = SimpleNamespace(
         model_type="qwen3_5_text",
@@ -791,7 +1066,7 @@ def test_server_defers_compatible_mtp_drafter_until_decode(monkeypatch):
 
     monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
     monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
-    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "1")
+    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "2")
     monkeypatch.setattr(
         server_generation,
         "load_model_resources",
@@ -820,7 +1095,7 @@ def test_server_initializes_vision_phase_swap(monkeypatch):
     gen.vision_phase_swap_path = "vision.safetensors"
 
     monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
-    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "1")
+    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "2")
     monkeypatch.setattr(
         server_generation,
         "load_model_resources",
@@ -833,6 +1108,37 @@ def test_server_initializes_vision_phase_swap(monkeypatch):
 
     constructor.assert_called_once_with(model, "vision.safetensors")
     assert gen.vision_phase_swap is phase_swap
+
+
+def test_server_initializes_language_head_phase_swap_for_continuous_batching(
+    monkeypatch,
+):
+    config = SimpleNamespace(eos_token_id=[])
+    language_model = SimpleNamespace(lm_head=object())
+    model = SimpleNamespace(language_model=language_model)
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    phase_swap = SimpleNamespace(load=MagicMock(), unload=MagicMock())
+    gen = _unstarted_response_generator()
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "4")
+    monkeypatch.setenv(
+        "MLX_VLM_LANGUAGE_HEAD_PHASE_SWAP_PATH", "head.safetensors"
+    )
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+    constructor = MagicMock(return_value=phase_swap)
+    monkeypatch.setattr(server_generation, "LanguageHeadPhaseSwap", constructor)
+
+    gen._initialize_model()
+
+    constructor.assert_called_once_with(language_model, "head.safetensors")
+    assert language_model.prefill_head_phase_swap is phase_swap
+    assert language_model.phase_residency_manager is gen.component_residency
+    assert gen.component_residency.contains("lm_head")
 
 
 def test_server_rejects_chunk_local_embeddings_for_unsupported_models(monkeypatch):
@@ -857,7 +1163,6 @@ def test_server_rejects_chunk_local_embeddings_for_unsupported_models(monkeypatc
     ("draft_kind", "max_num_seqs", "message"),
     [
         ("dflash", "1", "supports MTP only"),
-        ("mtp", "2", "requires --max-num-seqs 1"),
     ],
 )
 def test_server_rejects_unsafe_deferred_drafter_modes(
@@ -885,6 +1190,574 @@ def test_server_rejects_unsafe_deferred_drafter_modes(
 
     with pytest.raises(ValueError, match=message):
         gen._initialize_model()
+
+
+def test_phase_cohort_admission_waits_for_active_batch_to_drain():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.chunk_local_input_embeddings = True
+    gen.vision_phase_swap = None
+    gen.draft_model = None
+    gen.draft_kind = None
+
+    assert gen._admission_capacity(active_count=0, max_num_seqs=2) == 2
+    assert gen._admission_capacity(active_count=1, max_num_seqs=2) == 1
+    assert gen._admission_capacity(active_count=2, max_num_seqs=2) == 0
+
+    gen.draft_model = object()
+    gen.draft_kind = "dflash"
+    assert gen._admission_capacity(active_count=1, max_num_seqs=2) == 0
+
+    gen.draft_kind = "mtp"
+    assert gen._admission_capacity(active_count=1, max_num_seqs=2) == 1
+
+    gen.chunk_local_input_embeddings = False
+    assert gen._admission_capacity(active_count=1, max_num_seqs=2) == 1
+
+
+def test_batch_kv_slot_budget_env(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_BATCH_KV_SLOT_BUDGET", raising=False)
+    assert server_generation.get_batch_kv_slot_budget() is None
+
+    monkeypatch.setenv("MLX_VLM_BATCH_KV_SLOT_BUDGET", "106496")
+    assert server_generation.get_batch_kv_slot_budget() == 106496
+
+    monkeypatch.setenv("MLX_VLM_BATCH_KV_SLOT_BUDGET", "0")
+    assert server_generation.get_batch_kv_slot_budget() is None
+
+
+def test_paged_registry_uses_token_capacity_and_supported_model_leaves(monkeypatch):
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    class Model:
+        head_dim = 256
+        n_kv_heads = 2
+
+        def make_cache(self):
+            return [ArraysCache(size=2), KVCache(), KVCache()]
+
+    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "2")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "257")
+    registry = server_generation.make_paged_turboquant_registry(Model())
+
+    assert registry.leaf_keys == (1,)
+    assert registry.spec_for(1).capacity_pages == 2
+    assert registry.spec_for(1).kv_heads == 2
+    assert registry.spec_for(1).head_dim == 256
+    registry.release()
+
+
+def test_paged_registry_reads_qwen_geometry_from_model_args(monkeypatch):
+    from mlx_vlm.models.cache import KVCache
+
+    class Model:
+        head_dim = 213
+        args = SimpleNamespace(head_dim=256, num_key_value_heads=4)
+
+        def make_cache(self):
+            return [KVCache(), KVCache()]
+
+    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "2")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "4096")
+    registry = server_generation.make_paged_turboquant_registry(Model())
+
+    assert registry.spec_for(0).head_dim == 256
+    assert registry.spec_for(0).kv_heads == 4
+    registry.release()
+
+
+def test_paged_registry_requires_explicit_capacity_and_concurrency(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", raising=False)
+    monkeypatch.delenv("MLX_VLM_MAX_NUM_SEQS", raising=False)
+
+    with pytest.raises(ValueError, match="CAPACITY_TOKENS is required"):
+        server_generation.make_paged_turboquant_registry(SimpleNamespace())
+
+
+def test_kv_budget_preserves_oversized_singleton_and_defers_peer(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_BATCH_KV_SLOT_BUDGET", "100")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    long_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=96,
+        args=server_generation.GenerationArguments(max_tokens=8),
+    )
+    short_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=2,
+        args=server_generation.GenerationArguments(max_tokens=8),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [long_request, short_request], active={}
+    )
+
+    assert admitted == [long_request]
+    assert deferred == [short_request]
+
+
+def test_paged_kv_budget_admits_by_useful_tokens_not_dense_rectangle(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "106496")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {1: {"context_budget_tokens": 98_304}}
+    short_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=8_000,
+        args=server_generation.GenerationArguments(max_tokens=8),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [short_request], active=active
+    )
+
+    assert admitted == [short_request]
+    assert deferred == []
+
+
+def test_paged_kv_budget_accounts_for_each_requests_tail_page(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "512")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {1: {"context_budget_tokens": 257}}
+    one_token = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1,
+        args=server_generation.GenerationArguments(max_tokens=0),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [one_token], active=active
+    )
+
+    assert admitted == []
+    assert deferred == [one_token]
+
+
+def test_paged_kv_budget_reserves_output_guarantee_not_requested_ceiling(
+    monkeypatch,
+):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "1024")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "128")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    first = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=256,
+        args=server_generation.GenerationArguments(max_tokens=768),
+    )
+    second = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=256,
+        args=server_generation.GenerationArguments(max_tokens=768),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [first, second], active={}
+    )
+
+    assert admitted == [first, second]
+    assert deferred == []
+    assert gen._request_context_budget(first) == 384
+
+
+def test_paged_kv_budget_tracks_elastic_output_already_consumed(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "1024")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "128")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {
+        1: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 300,
+            "context_budget_tokens": 384,
+        }
+    }
+    peer = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=256,
+        args=server_generation.GenerationArguments(max_tokens=768),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission([peer], active=active)
+
+    assert admitted == []
+    assert deferred == [peer]
+
+
+def test_paged_kv_budget_keeps_page_rounded_admission_safety_margin(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "1024")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "128")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_SAFETY_TOKENS", "1")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {
+        1: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 0,
+            "context_budget_tokens": 384,
+        }
+    }
+    peer = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=256,
+        args=server_generation.GenerationArguments(max_tokens=128),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission([peer], active=active)
+
+    assert admitted == []
+    assert deferred == [peer]
+
+
+def test_elastic_capacity_finishes_largest_surplus_consumer(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "1024")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "128")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {
+        1: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 300,
+            "queued_at": 1.0,
+        },
+        2: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 128,
+            "queued_at": 2.0,
+        },
+    }
+
+    assert gen._elastic_capacity_victims(active) == [1]
+
+
+def test_elastic_capacity_is_disabled_without_output_guarantee(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "512")
+    monkeypatch.delenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", raising=False)
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {
+        1: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 300,
+        }
+    }
+
+    assert gen._elastic_capacity_victims(active) == []
+
+
+def test_elastic_capacity_never_breaks_admission_guarantees(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "768")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "128")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {
+        1: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 127,
+        },
+        2: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 127,
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="guarantees exceed"):
+        gen._elastic_capacity_victims(active)
+
+
+def test_paged_scheduler_fills_free_lane_with_short_request_behind_long(
+    monkeypatch,
+):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "2048")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS", "8")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {1: {"context_budget_tokens": 1024}}
+    long_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1280,
+        args=server_generation.GenerationArguments(max_tokens=1),
+    )
+    short_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=128,
+        args=server_generation.GenerationArguments(max_tokens=1),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [long_request, short_request], active=active, admission_capacity=1
+    )
+
+    assert admitted == [short_request]
+    assert deferred == [long_request]
+    assert long_request.kv_bypass_count == 1
+
+
+def test_paged_scheduler_stops_bypassing_aged_request(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "2048")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS", "1")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {1: {"context_budget_tokens": 1024}}
+    long_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1280,
+        args=server_generation.GenerationArguments(max_tokens=1),
+        kv_bypass_count=1,
+    )
+    short_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=128,
+        args=server_generation.GenerationArguments(max_tokens=1),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [long_request, short_request], active=active, admission_capacity=1
+    )
+
+    assert admitted == []
+    assert deferred == [long_request, short_request]
+    assert long_request.kv_bypass_count == 1
+
+
+def test_deferred_kv_request_does_not_block_singleton_mtp_repromotion(
+    monkeypatch,
+):
+    monkeypatch.setenv("MLX_VLM_MTP_REPROMOTE", "1")
+    monkeypatch.setenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "1")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.requests = Queue()
+    gen.requests.put(object())  # Deferred because its KV reservation cannot fit.
+    batch_gen = SimpleNamespace(has_pending_prompts=False)
+
+    assert gen._can_repromote_singleton_mtp(
+        active={1: {}}, batch_gen=batch_gen, admitted=[]
+    )
+    assert not gen._can_repromote_singleton_mtp(
+        active={1: {}}, batch_gen=batch_gen, admitted=[object()]
+    )
+
+
+def test_paged_scheduler_respects_active_lane_capacity(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "4096")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER", "1")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    pending = [
+        server_generation.QueuedGenerationRequest(
+            rqueue=Queue(),
+            raw_inputs={},
+            prompt_tokens=128,
+            args=server_generation.GenerationArguments(max_tokens=1),
+        )
+        for _ in range(2)
+    ]
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        pending, active={}, admission_capacity=1
+    )
+
+    assert admitted == [pending[0]]
+    assert deferred == [pending[1]]
+
+
+def test_paged_scheduler_drains_large_queue_without_starving_head(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "4096")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS", "8")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    long_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=2304,
+        args=server_generation.GenerationArguments(max_tokens=1),
+        request_id="long-head",
+    )
+    waiting = [long_request]
+    waiting.extend(
+        server_generation.QueuedGenerationRequest(
+            rqueue=Queue(),
+            raw_inputs={},
+            prompt_tokens=64 + index,
+            args=server_generation.GenerationArguments(max_tokens=1),
+            request_id=f"short-{index}",
+        )
+        for index in range(99)
+    )
+    active = {1: {"context_budget_tokens": 2048}}
+    completed = []
+    blocked_rounds = 0
+
+    for round_index in range(200):
+        window, tail = waiting[:32], waiting[32:]
+        admitted, deferred = gen._partition_kv_budget_admission(
+            window, active=active, admission_capacity=1
+        )
+        waiting = deferred + tail
+        if admitted:
+            completed.extend(request.request_id for request in admitted)
+        else:
+            blocked_rounds += 1
+        if round_index == 9:
+            active = {}
+        if not waiting:
+            break
+
+    assert len(completed) == 100
+    assert len(set(completed)) == 100
+    assert completed.index("long-head") == 8
+    assert blocked_rounds == 2
+
+
+def test_kv_budget_opportunistically_admits_until_projected_rectangle_is_full(
+    monkeypatch,
+):
+    monkeypatch.setenv("MLX_VLM_BATCH_KV_SLOT_BUDGET", "100")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {1: {"context_budget_tokens": 40}}
+    second = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=12,
+        args=server_generation.GenerationArguments(max_tokens=8),
+    )
+    third = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=2,
+        args=server_generation.GenerationArguments(max_tokens=8),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [second, third], active=active
+    )
+
+    # B2 projects to 2 * max(40, 20) = 80 slots and fits.  B3 would project
+    # to 3 * 40 = 120, so the third row remains queued.
+    assert admitted == [second]
+    assert deferred == [third]
+
+
+def test_kv_budget_disabled_preserves_existing_unbounded_admission(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_BATCH_KV_SLOT_BUDGET", raising=False)
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    pending = [object(), object()]
+
+    admitted, deferred = gen._partition_kv_budget_admission(pending, active={})
+
+    assert admitted == pending
+    assert deferred == []
+
+
+def test_active_phase_admission_skips_media_and_preserves_it_for_next_cohort():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.requests = Queue()
+    gen._stop = False
+    media = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1,
+        args=server_generation.GenerationArguments(),
+        images=[object()],
+    )
+    text = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1,
+        args=server_generation.GenerationArguments(),
+    )
+    gen.requests.put(media)
+    gen.requests.put(text)
+
+    admitted, should_stop = gen._collect_active_phase_text_requests(capacity=1)
+
+    assert admitted == [text]
+    assert not should_stop
+    assert gen.requests.get_nowait() is media
+
+
+def test_active_phase_admission_drops_cancelled_media_before_vision_load():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.requests = Queue()
+    gen._stop = False
+    cancelled = Event()
+    cancelled.set()
+    media = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1,
+        args=server_generation.GenerationArguments(),
+        images=[object()],
+        cancel_event=cancelled,
+        request_id="cancelled-media",
+    )
+    text = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1,
+        args=server_generation.GenerationArguments(),
+    )
+    gen.requests.put(media)
+    gen.requests.put(text)
+
+    admitted, should_stop = gen._collect_active_phase_text_requests(capacity=1)
+
+    assert admitted == [text]
+    assert not should_stop
+    assert gen.requests.empty()
+
+
+def test_active_phase_text_admission_supports_unbounded_capacity():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.requests = Queue()
+    gen._stop = False
+    media = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1,
+        args=server_generation.GenerationArguments(),
+        images=[object()],
+    )
+    texts = [
+        server_generation.QueuedGenerationRequest(
+            rqueue=Queue(),
+            raw_inputs={},
+            prompt_tokens=1,
+            args=server_generation.GenerationArguments(),
+        )
+        for _ in range(2)
+    ]
+    gen.requests.put(media)
+    for text in texts:
+        gen.requests.put(text)
+
+    admitted, should_stop = gen._collect_active_phase_text_requests(capacity=None)
+
+    assert admitted == texts
+    assert not should_stop
+    assert gen.requests.get_nowait() is media
 
 
 def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
@@ -962,6 +1835,30 @@ def test_server_includes_tokenizer_eos_in_stop_tokens(monkeypatch):
     gen._initialize_model()
 
     assert gen.stop_tokens == {248044, 248046}
+
+
+def test_server_capacity_mode_disables_eos_stopping(monkeypatch):
+    config = SimpleNamespace(eos_token_id=[248044])
+    tokenizer = SimpleNamespace(eos_token_id=248046)
+    stopping_criteria = StoppingCriteria([248044], tokenizer)
+    tokenizer.stopping_criteria = stopping_criteria
+    model = SimpleNamespace(language_model=SimpleNamespace(config=config))
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    gen = _unstarted_response_generator()
+
+    monkeypatch.setenv("MLX_VLM_CAPACITY_IGNORE_EOS", "1")
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+
+    gen._initialize_model()
+
+    assert gen.stop_tokens == set()
+    assert stopping_criteria.eos_token_ids == []
 
 
 def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
@@ -2496,7 +3393,9 @@ def test_stream_endpoints_do_not_clear_mlx_cache_on_close(
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 [
                     server.StreamingToken(
@@ -2701,7 +3600,9 @@ def test_chat_completions_streaming_forwards_explicit_sampling_args(
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             captured["prompt"] = prompt
             captured["images"] = images
             captured["audio"] = audio
@@ -2758,7 +3659,9 @@ def test_chat_completions_streaming_splits_gemma_thinking_channel_content(
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=8), iter(
                 _gemma_thinking_channel_chunks()
             )
@@ -2810,7 +3713,9 @@ def test_chat_completions_streaming_uses_custom_thinking_markers(client, monkeyp
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=8), iter(
                 [
                     server.StreamingToken(
@@ -2876,7 +3781,9 @@ def test_chat_completions_streaming_uses_prompt_opened_thinking_without_flag(
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=8), iter(
                 [
                     server.StreamingToken(
@@ -2958,7 +3865,9 @@ def test_chat_completions_streaming_keeps_plain_output_as_content_when_thinking_
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=8), iter(
                 [
                     server.StreamingToken(
@@ -3404,7 +4313,9 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=10), iter(
                 [
                     server.StreamingToken(
@@ -3484,7 +4395,9 @@ def test_chat_completions_streaming_response_template_tool_calls(client, monkeyp
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=10), iter(
                 [
                     server.StreamingToken(
@@ -3504,7 +4417,7 @@ def test_chat_completions_streaming_response_template_tool_calls(client, monkeyp
                 ]
             )
 
-    from mlx_vlm.tool_parsers import atem as tool_module
+    from mlx_vlm.tools.parsers import atem as tool_module
 
     monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
 
@@ -4172,7 +5085,7 @@ def test_anthropic_nonstreaming_preserves_thinking_with_tool_use(client, monkeyp
         generation_tps=0.0,
         peak_memory=0.0,
     )
-    from mlx_vlm.tool_parsers import atem as tool_module
+    from mlx_vlm.tools.parsers import atem as tool_module
 
     with (
         patch.object(
@@ -4228,7 +5141,9 @@ def test_anthropic_messages_streaming_uses_anthropic_events(client, monkeypatch)
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 [
                     server.StreamingToken(
@@ -4290,7 +5205,9 @@ def test_anthropic_messages_streaming_splits_gemma_thinking_channel_content(
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 _gemma_thinking_channel_chunks()
             )
@@ -4339,7 +5256,9 @@ def test_anthropic_messages_streaming_uses_custom_thinking_markers(client, monke
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 [
                     server.StreamingToken(
@@ -4402,7 +5321,9 @@ def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch)
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 [
                     server.StreamingToken(
@@ -4786,6 +5707,49 @@ class TestResponseGenerator:
         assert gen.requests.empty()
         image_hash.assert_not_called()
 
+    def test_generate_rejects_single_request_over_paged_pool_capacity(
+        self, monkeypatch
+    ):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen.draft_model = None
+        gen.apc_manager = None
+        gen.apc_mode = None
+        gen._preprocess_request = lambda prompt, images, audio, videos: {
+            "input_ids": mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+        }
+        gen.requests = Queue()
+
+        monkeypatch.delenv("MAX_KV_SIZE", raising=False)
+        monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+        monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "256")
+
+        with pytest.raises(
+            server.PromptTooLongError,
+            match=r"257 context tokens.*paged KV pool capacity is 256",
+        ):
+            gen.generate("prompt", args=server.GenerationArguments(max_tokens=252))
+
+        assert gen.requests.empty()
+
+    def test_stream_validation_checks_paged_pool_without_max_kv_size(
+        self, monkeypatch
+    ):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen._preprocess_request = lambda prompt, images, audio, videos: {
+            "input_ids": mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+        }
+
+        monkeypatch.delenv("MAX_KV_SIZE", raising=False)
+        monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+        monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "256")
+
+        with pytest.raises(server.PromptTooLongError, match="paged KV pool"):
+            gen.validate_context_budget(
+                "prompt", args=server.GenerationArguments(max_tokens=252)
+            )
+
     def test_generate_serializes_budget_criteria_with_tokenizer_preprocessing(self):
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         gen.wait_until_ready = lambda: None
@@ -5141,6 +6105,37 @@ class TestResponseGenerator:
             next(token_iter)
 
         assert cancelled == ["req-1"]
+
+    def test_token_iterator_consumes_activity_heartbeat_without_emitting_it(self):
+        cancelled = []
+        token = SimpleNamespace(text="hello")
+        rqueue = Queue()
+        rqueue.put(server_generation._TOKEN_QUEUE_ACTIVITY)
+        rqueue.put(token)
+        token_iter = server_generation._TokenIterator(
+            rqueue,
+            "req-1",
+            cancelled.append,
+            0.01,
+        )
+
+        assert next(token_iter) is token
+        assert cancelled == []
+
+    def test_batch_step_reports_gpu_activity_to_all_active_iterators(self):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        first_queue = Queue()
+        second_queue = Queue()
+        batch_gen = SimpleNamespace(next=lambda **kwargs: ([], []), _prompt_batch=None)
+        active = {
+            1: {"rqueue": first_queue},
+            2: {"rqueue": second_queue},
+        }
+
+        gen._step(batch_gen, active)
+
+        assert first_queue.get_nowait() is server_generation._TOKEN_QUEUE_ACTIVITY
+        assert second_queue.get_nowait() is server_generation._TOKEN_QUEUE_ACTIVITY
 
     def test_token_iterator_close_cancels_while_next_blocks(self):
         cancelled = []
@@ -5709,7 +6704,7 @@ class TestResponseGenerator:
         gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
         gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
         gen.top_logprobs_k = 0
-        apc_manager = object()
+        apc_manager = SimpleNamespace(prepare_prefill=MagicMock(), close=MagicMock())
         gen.apc_manager = apc_manager
         gen.prefill_step_size = 3072
         gen.tokenizer = SimpleNamespace()
@@ -5771,6 +6766,9 @@ class TestResponseGenerator:
         assert kwargs["compute_logprobs"] is False
         assert kwargs["prefill_step_size"] == 3072
         assert kwargs["apc_manager"] is apc_manager
+        assert apc_manager.prepare_prefill.call_count == 2
+        apc_manager.prepare_prefill.assert_called_with(1)
+        apc_manager.close.assert_called_once_with()
         assert batch_state["instance"].next_active_sizes == [2]
 
     @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
@@ -7125,6 +8123,10 @@ class TestSplitThinking:
         assert reasoning == "Thinking text"
         assert content == "Answer."
 
+    @pytest.mark.parametrize("prefix", ["", "thought\n"])
+    def test_channel_close_only(self, prefix):
+        assert server._split_thinking(f"{prefix}got it<channel|>42") == ("got it", "42")
+
     def test_no_thinking(self):
         text = "Just plain text."
         reasoning, content = server._split_thinking(text)
@@ -7476,8 +8478,8 @@ class TestProcessToolCalls:
         # Minimal tool module mock
         module = SimpleNamespace(tool_call_start="<tc>", tool_call_end="</tc>")
         result = server.process_tool_calls("Just text.", module, [])
-        assert result["calls"] == []
-        assert result["remaining_text"] == "Just text."
+        assert result.calls == []
+        assert result.remaining_text == "Just text."
 
     def test_parser_can_return_multiple_tool_calls(self):
         module = SimpleNamespace(
@@ -7491,17 +8493,80 @@ class TestProcessToolCalls:
 
         result = server.process_tool_calls("Before <tc>[]</tc> after", module, [])
 
-        assert result["remaining_text"] == "Before   after"
-        assert [call["function"]["name"] for call in result["calls"]] == [
+        assert result.remaining_text == "Before   after"
+        assert [call["function"]["name"] for call in result.calls] == [
             "grep",
             "read",
         ]
-        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
+        assert json.loads(result.calls[0]["function"]["arguments"]) == {
             "pattern": "foo"
         }
-        assert json.loads(result["calls"][1]["function"]["arguments"]) == {
+        assert json.loads(result.calls[1]["function"]["arguments"]) == {
             "path": "file.py"
         }
+
+    minicpm5_call = (
+        '<function name="write_file"><param name="content">'
+        "<![CDATA[  <html>\nA & B\n</html>  ]]></param>"
+        '<param name="version">123</param><param name="count">3</param>'
+        '<param name="enabled">True</param></function>'
+    )
+
+    def test_detects_minicpm5_chat_template(self):
+        template = """{{ '<function name="' ~ tool_call.name ~ '">' }}
+    {{ '<param name="' ~ param_name ~ '">' }}"""
+        assert server.load_tool_module(_infer_tool_parser(template)) is minicpm5
+
+    def test_minicpm5_cdata_and_argument_types(self):
+        tools = [
+            {
+                "function": {
+                    "name": "write_file",
+                    "parameters": {"properties": {"version": {"type": "string"}}},
+                }
+            }
+        ]
+        result = minicpm5.parse_tool_call(self.minicpm5_call, tools)
+
+        assert result == {
+            "name": "write_file",
+            "arguments": {
+                "content": "  <html>\nA & B\n</html>  ",
+                "version": "123",
+                "count": 3,
+                "enabled": True,
+            },
+        }
+
+    def test_minicpm5_multiple_calls_and_streamed_markup(self):
+        text = f'Before{self.minicpm5_call}Between<function name="get_time"></function>After'
+        result = server.process_tool_calls(text, minicpm5, tools=None)
+
+        assert result.remaining_text == "Before Between After"
+        assert [call["function"]["name"] for call in result.calls] == [
+            "write_file",
+            "get_time",
+        ]
+        assert json.loads(result.calls[1]["function"]["arguments"]) == {}
+
+        state = server.ToolCallStreamState(
+            minicpm5.tool_call_start, minicpm5.tool_call_end
+        )
+        visible = "".join(state.feed(char) or "" for char in text)
+        visible += state.feed("", last=True) or ""
+        assert visible == "BeforeBetweenAfter"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '<function name="lookup"><param name="value">unfinished',
+            '<function name=""></function>',
+            '<function name="lookup"><param>3</param></function>',
+        ],
+    )
+    def test_minicpm5_rejects_malformed_calls(self, text):
+        with pytest.raises(ValueError):
+            minicpm5.parse_tool_call(text)
 
 
 class TestCountThinkingTagTokens:
@@ -8277,3 +9342,153 @@ class TestReranking:
         loaded = server.get_cached_model("reranker", None, model_kind="reranker")
 
         assert loaded == (model, processor, model.config)
+
+
+@dataclass
+class _FakeAlignedToken:
+    id: int
+    text: str
+    start: float
+    duration: float
+    end: float = 0.0
+
+    def __post_init__(self):
+        self.end = self.start + self.duration
+
+
+@dataclass
+class _FakeAlignedSentence:
+    text: str
+    tokens: list
+    start: float = 0.0
+    end: float = 0.0
+
+    def __post_init__(self):
+        self.start = self.tokens[0].start
+        self.end = self.tokens[-1].end
+
+
+@dataclass
+class _FakeAlignedResult:
+    text: str
+    sentences: list
+
+
+@dataclass
+class _FakeSTTOutput:
+    text: str
+    segments: list = None
+    language: str = None
+
+
+@dataclass
+class _FakeStreamingResult:
+    text: str
+    tokens: list
+    is_final: bool
+    start_time: float
+    end_time: float
+
+
+def _fake_parakeet_result():
+    first = _FakeAlignedSentence(
+        "Hello world.",
+        [
+            _FakeAlignedToken(1, "Hello", 0.0, 0.4),
+            _FakeAlignedToken(2, " world.", 0.4, 0.5),
+        ],
+    )
+    second = _FakeAlignedSentence("Bye.", [_FakeAlignedToken(3, "Bye.", 1.0, 0.3)])
+    return _FakeAlignedResult("Hello world. Bye.", [first, second])
+
+
+class TestSTTSegmentSerialization:
+    """Serialization of STT results into OpenAI-style transcription payloads.
+
+    Regression coverage for NeMo-alignment models (Parakeet/Canary) whose
+    ``AlignedResult`` exposes ``sentences`` rather than ``segments`` (issue 2183).
+    """
+
+    def test_derives_segments_from_nemo_sentences(self):
+        from mlx_vlm.server.audio import _stt_item_to_dict
+
+        data = _stt_item_to_dict(_fake_parakeet_result())
+
+        assert "segments" in data
+        segments = data["segments"]
+        assert [s["text"] for s in segments] == ["Hello world.", "Bye."]
+        assert segments[0]["start"] == 0.0
+        assert abs(segments[0]["end"] - 0.9) < 1e-6
+        assert segments[1]["start"] == 1.0
+        assert abs(segments[1]["end"] - 1.3) < 1e-6
+
+    def test_pipeline_preserves_nemo_segments(self):
+        from mlx_vlm.server.audio import (
+            _iter_stt_items,
+            _sanitize_for_json,
+            _stt_item_to_dict,
+            _transcription_result_from_chunks,
+        )
+
+        chunks = [
+            json.dumps(_sanitize_for_json(_stt_item_to_dict(item))) + "\n"
+            for item in _iter_stt_items(_fake_parakeet_result())
+        ]
+        result = _transcription_result_from_chunks(chunks)
+
+        assert result["text"].startswith("Hello world.")
+        assert len(result.get("segments") or []) == 2
+
+    def test_whisper_segments_unchanged(self):
+        from mlx_vlm.server.audio import _stt_item_to_dict
+
+        whisper = _FakeSTTOutput(
+            "hi", segments=[{"start": 0.0, "end": 1.0, "text": "hi"}], language="en"
+        )
+        data = _stt_item_to_dict(whisper)
+
+        assert data["segments"] == [{"start": 0.0, "end": 1.0, "text": "hi"}]
+        assert data["language"] == "en"
+        assert "sentences" not in data
+
+    def test_plain_text_item_unchanged(self):
+        from mlx_vlm.server.audio import _stt_item_to_dict
+
+        assert _stt_item_to_dict("just text") == {"text": "just text"}
+
+    def test_streaming_result_gets_no_segments(self):
+        from mlx_vlm.server.audio import _stt_item_to_dict
+
+        data = _stt_item_to_dict(
+            _FakeStreamingResult("partial", [1, 2], False, 0.0, 0.5)
+        )
+
+        assert "segments" not in data
+        assert data["is_final"] is False
+
+    def test_real_aligned_result_if_available(self):
+        pytest.importorskip("mlx_audio.stt.models.nemo.alignment")
+        from mlx_audio.stt.models.nemo.alignment import (
+            AlignedSentence,
+            AlignedToken,
+            sentences_to_result,
+        )
+
+        from mlx_vlm.server.audio import _stt_item_to_dict
+
+        result = sentences_to_result(
+            [
+                AlignedSentence(
+                    "hello",
+                    [
+                        AlignedToken(id=1, text="hel", start=0.0, duration=0.2),
+                        AlignedToken(id=2, text="lo", start=0.2, duration=0.3),
+                    ],
+                )
+            ]
+        )
+        data = _stt_item_to_dict(result)
+
+        assert data["segments"] == [
+            {"id": 0, "start": 0.0, "end": 0.5, "text": "hello"}
+        ]

@@ -83,6 +83,9 @@ def test_hash_chain_and_image_hash_are_deterministic():
 
 
 def test_direct_exact_disk_write_is_explicit_and_borrows_input(monkeypatch):
+    class BorrowedCache:
+        state = ()
+
     class Disk:
         def __init__(self):
             self.saved = None
@@ -90,14 +93,19 @@ def test_direct_exact_disk_write_is_explicit_and_borrows_input(monkeypatch):
         def set_write_callbacks(self, *_args):
             pass
 
-        def save_exact_cache_sync(self, *args):
+        def flush(self):
+            pass
+
+        def save_exact_cache(self, *args, synchronous=False):
+            assert synchronous
             self.saved = args
+            return True
 
     monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "0")
     monkeypatch.setenv("APC_EXACT_DIRECT_DISK_WRITE", "1")
     disk = Disk()
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    source = [Mock(name="borrowed-cache")]
+    source = [BorrowedCache()]
 
     assert manager.direct_disk_writes
     assert manager.store_exact_cache(list(range(16)), source)
@@ -131,12 +139,73 @@ def test_direct_exact_disk_write_roundtrip_is_immediately_visible(
 
     disk = DiskBlockStore(tmp_path, namespace="direct-exact")
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    manager._disk_min_free_ram_bytes = 1
+    monkeypatch.setattr(apc_module, "_free_ram_bytes", lambda: 0)
+    stats_before = manager.stats_snapshot()
+    assert (
+        manager.peek_exact_prefix_length(token_ids + [999], extra_hash=17)
+        == len(token_ids)
+    )
+    assert manager.peek_exact_prefix_length(token_ids + [999], extra_hash=18) == 0
+    assert manager.stats_snapshot() == stats_before
+    assert manager.lookup_exact_cache(token_ids + [999], extra_hash=17) == (None, 0)
+    warm, matched_tokens = manager.lookup_exact_cache(
+        token_ids + [999],
+        extra_hash=17,
+        defer_paged_q4=True,
+    )
+    assert matched_tokens == len(token_ids)
+    assert warm is not None
+    manager._disk_min_free_ram_bytes = 0
+    monkeypatch.setattr(apc_module, "_free_ram_bytes", lambda: 1 << 40)
     warm, matched_tokens = manager.lookup_exact_cache(token_ids + [999], extra_hash=17)
 
     assert matched_tokens == len(token_ids)
     assert warm is not None
     _assert_allclose(warm[0][0], source[0][0])
     _assert_allclose(warm[1].keys[..., :matched_tokens, :], source[1].keys)
+    manager.close()
+
+
+def test_direct_exact_disk_write_borrows_paged_q4_runs_without_materialize(
+    tmp_path, monkeypatch
+):
+    from mlx_vlm.paged_turboquant_cache import PagedBatchTurboQuantKVCache
+
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "0")
+    monkeypatch.setenv("APC_EXACT_DIRECT_DISK_WRITE", "1")
+    token_ids = list(range(513))
+    paged = PagedBatchTurboQuantKVCache([0], bits=4, capacity_pages=4)
+    paged.update_and_fetch(
+        mx.random.normal((1, 2, len(token_ids), 256)).astype(mx.bfloat16),
+        mx.random.normal((1, 2, len(token_ids), 256)).astype(mx.bfloat16),
+    )
+    expected_keys, expected_values = paged.materialize(0)
+    mx.eval(expected_keys, expected_values)
+
+    monkeypatch.setattr(
+        paged,
+        "materialize",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("direct paged APC store must not materialize contiguous KV")
+        ),
+    )
+    borrowed = extract_prompt_cache_from_batch([paged], 0, detach=False)
+    disk = DiskBlockStore(tmp_path, namespace="direct-paged-exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, borrowed, extra_hash=23)
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="direct-paged-exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    warm, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=23)
+
+    assert matched == len(token_ids)
+    assert warm is not None
+    assert bool(mx.array_equal(warm[0].keys.norms, expected_keys.norms).item())
+    assert bool(mx.array_equal(warm[0].keys.indices, expected_keys.indices).item())
+    assert bool(mx.array_equal(warm[0].values.norms, expected_values.norms).item())
+    assert bool(mx.array_equal(warm[0].values.indices, expected_values.indices).item())
     manager.close()
 
 
@@ -665,6 +734,7 @@ def test_disk_store_recovers_when_cache_dir_is_deleted(tmp_path):
 def test_from_env_respects_opt_in_and_disk_config(tmp_path, monkeypatch):
     monkeypatch.delenv("APC_ENABLED", raising=False)
     monkeypatch.delenv("APC_DISK_PATH", raising=False)
+    monkeypatch.setenv("MLX_VLM_CACHE_HOME", str(tmp_path / "cache"))
     assert from_env() is None
 
     monkeypatch.setenv("APC_ENABLED", "1")
@@ -675,7 +745,8 @@ def test_from_env_respects_opt_in_and_disk_config(tmp_path, monkeypatch):
     assert manager is not None
     assert manager.block_size == 8
     assert manager.num_blocks == 3
-    assert manager.disk is None
+    assert manager.disk.dir == tmp_path / "cache" / "apc" / "default"
+    assert manager.disk.max_bytes == 20 * (1 << 30)
     manager.close()
 
     monkeypatch.setenv("APC_DISK_PATH", str(tmp_path))
@@ -1438,7 +1509,8 @@ def test_exact_cache_disk_write_stats_only_count_committed_files(tmp_path, monke
     monkeypatch.setattr(apc_module.mx, "save_safetensors", fail_after_creating_partial)
     disk = DiskBlockStore(tmp_path, namespace="failed-exact-write")
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    assert manager.store_exact_cache(token_ids, [kv])
+    # Disk-only snapshots write synchronously, so failure is known on return.
+    assert not manager.store_exact_cache(token_ids, [kv])
     disk._q.join()
 
     stats = manager.stats_snapshot()

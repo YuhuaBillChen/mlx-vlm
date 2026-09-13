@@ -26,6 +26,10 @@ class APCCoordinator:
         self.model = model
         self.plan: PrefixCachePlan = build_prefix_cache_plan(model)
 
+    def prepare_prefill(self, token_count: int) -> None:
+        if self.enabled:
+            self.manager.prepare_prefill(token_count)
+
     @property
     def enabled(self) -> bool:
         return self.manager is not None and self.plan.restorable
@@ -61,6 +65,7 @@ class APCCoordinator:
         safe_lookup_min: int,
         suffix_is_text_only: Callable[[int], bool],
         prefix_has_media: Callable[[int], bool],
+        defer_paged_q4: bool = False,
     ) -> Optional[dict]:
         if not self.enabled:
             return None
@@ -74,6 +79,7 @@ class APCCoordinator:
             safe_lookup_min=safe_lookup_min,
             suffix_is_text_only=suffix_is_text_only,
             prefix_has_media=prefix_has_media,
+            defer_paged_q4=defer_paged_q4,
         )
         if hit is not None:
             hit["cache_plan"] = self.plan
@@ -93,6 +99,38 @@ class APCCoordinator:
             media_token_ids,
             max_prefix_tokens=len(token_ids) - 1,
         )
+
+    def checkpoint_lengths(
+        self, token_ids: Sequence[int], media_token_ids: set[int]
+    ) -> List[int]:
+        """Bounded intermediate states plus the final conversation checkpoint.
+
+        Stateful caches cannot roll back the final snapshot to a divergence.
+        Capture earlier states while prefilling, aligned across requests. Limit
+        captures to the resident entry budget (two for a disk-only manager),
+        rather than copying an ever-growing cache at every prefill chunk.
+        """
+        final = self.checkpoint_len(token_ids, media_token_ids)
+        if final <= 0:
+            return []
+        interval = self.manager.checkpoint_interval_tokens
+        budget = self.manager._exact_cache_max or (2 if self.manager.disk else 1)
+        if interval <= 0 or budget <= 1:
+            return [final]
+        from .apc import adjust_prefix_to_text_suffix_boundary
+
+        block_size = self.manager.block_size
+        interval = ((interval + block_size - 1) // block_size) * block_size
+        last = ((final - 1) // interval) * interval
+        first = max(interval, last - (budget - 2) * interval)
+        lengths = {final}
+        for boundary in range(first, last + 1, interval):
+            boundary = adjust_prefix_to_text_suffix_boundary(
+                token_ids, boundary, media_token_ids, max_prefix_tokens=final
+            )
+            if self.manager.exact_cache_min_tokens <= boundary < final:
+                lengths.add(boundary)
+        return sorted(lengths)
 
     def merge_rows(
         self,
@@ -156,12 +194,31 @@ class APCCoordinator:
     ) -> bool:
         if not self.enabled or not self.is_checkpoint:
             return False
-        from .apc import snapshot_prompt_cache_row
+        from .apc import (
+            _cache_nbytes,
+            _prompt_cache_is_batch_shaped,
+            snapshot_prompt_cache_row,
+        )
 
+        direct_disk_write = bool(
+            getattr(self.manager, "direct_disk_writes", False)
+        )
+        batch_shaped = _prompt_cache_is_batch_shaped(prompt_cache)
+        # A detached batch row can allocate a full cache before
+        # store_exact_cache decides whether it can retain it. The explicit
+        # disk-only path instead borrows page views and serializes them
+        # synchronously on this producer thread, so it needs no clone reserve.
+        if batch_shaped and not direct_disk_write:
+            if self.manager.disk is not None:
+                self.manager.disk.flush()
+            if not self.manager._make_room(_cache_nbytes(prompt_cache)):
+                with self.manager.lock:
+                    self.manager.stats.memory_skips += 1
+                return False
         snapshot = snapshot_prompt_cache_row(
             prompt_cache,
             batch_idx or 0,
-            detach=not self.manager.direct_disk_writes,
+            clone=False,
         )
         if snapshot is None:
             return False
@@ -169,7 +226,6 @@ class APCCoordinator:
             token_ids,
             snapshot,
             extra_hash=extra_hash,
-            take_ownership=True,
         )
 
     def commit(

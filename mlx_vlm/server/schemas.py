@@ -21,6 +21,21 @@ def get_server_max_tokens():
     return int(os.environ.get("MLX_VLM_MAX_TOKENS", DEFAULT_MAX_TOKENS))
 
 
+_TOOL_PARSER_DESC = (
+    "Force a specific tool-call parser by name, bypassing chat-template inference."
+)
+
+
+def _check_tool_parser(cls, value: Optional[str]) -> Optional[str]:
+    """Reject an unknown ``tool_parser`` override, naming the known parsers."""
+    from ..tools import SPECS
+
+    if value is not None and value not in {spec.name for spec in SPECS}:
+        known = ", ".join(sorted(spec.name for spec in SPECS))
+        raise ValueError(f"unknown tool_parser {value!r}; known parsers: {known}")
+    return value
+
+
 class FlexibleBaseModel(BaseModel):
     """Base model that ignores/accepts any unknown OpenAI SDK fields."""
 
@@ -394,6 +409,8 @@ class OpenAIRequest(FlexibleBaseModel):
         None, description="Responses API tool definitions."
     )
     tool_choice: Optional[Any] = Field(None, description="Tool choice policy.")
+    tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
+    _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
     store: Optional[bool] = Field(
         True, description="Whether to store this response for later retrieval."
     )
@@ -448,6 +465,12 @@ class GenerationTimings(BaseModel):
     draft_rounds: Optional[int] = None
     draft_n: Optional[int] = None
     draft_n_accepted: Optional[int] = None
+    capacity_exhausted: bool = False
+    guaranteed_output_tokens: Optional[int] = None
+    elastic_output_tokens: int = 0
+    capacity_wait_ms: float = 0.0
+    preemption_count: int = 0
+    recompute_tokens: int = 0
 
     @staticmethod
     def _derive_gen_tps(token_times: List[float]) -> Optional[float]:
@@ -492,6 +515,18 @@ class GenerationTimings(BaseModel):
             draft_rounds=getattr(metrics, "draft_rounds", None),
             draft_n=getattr(metrics, "draft_n", None),
             draft_n_accepted=getattr(metrics, "draft_n_accepted", None),
+            capacity_exhausted=bool(
+                getattr(metrics, "capacity_exhausted", False)
+            ),
+            guaranteed_output_tokens=getattr(
+                metrics, "guaranteed_output_tokens", None
+            ),
+            elastic_output_tokens=int(
+                getattr(metrics, "elastic_output_tokens", 0) or 0
+            ),
+            capacity_wait_ms=float(
+                getattr(metrics, "capacity_wait_ms", 0.0) or 0.0
+            ),
         )
 
 
@@ -850,6 +885,8 @@ class ChatRequest(GenerationRequest):
             "Controls tool use: none, auto, required, or a specific function."
         ),
     )
+    tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
+    _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
 
 
 class TopLogprob(BaseModel):
@@ -928,6 +965,8 @@ class AnthropicRequest(FlexibleBaseModel):
     stop_sequences: Optional[List[str]] = None
     tools: Optional[List[Any]] = None
     tool_choice: Optional[Any] = None
+    tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
+    _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
     metadata: Optional[Any] = None
     thinking: Optional[Any] = None
     output_config: Optional[Any] = None
